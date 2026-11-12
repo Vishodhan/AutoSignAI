@@ -1,0 +1,28 @@
+.venv/
+__pycache__/
+.pytest_cache/
+*.pyc
+
+# Secrets (Gemini API key)
+.env
+
+# Local editor/assistant settings
+.claude/settings.local.json
+
+# Created by the app: agreements, signed copies, the audit log
+storage/
+output/
+inbox/
+settings.json
+
+# Any signature image. Never commit one; the tests make their own.
+data/signature.png
+*.signature.png
+
+# Sample contracts: several are licensed for internal testing only (see data/new_samples/SOURCES.md).
+# The tests skip the ones that are missing.
+data/*.pdf
+data/new_samples/*.pdf
+
+# Earlier design notes for the first (local, company-side) version; kept out of the public repo.
+docs/AutoSignPDF_System_Design.html

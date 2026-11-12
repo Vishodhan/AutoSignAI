@@ -1,0 +1,38 @@
+[project]
+name = "autosignpdf"
+version = "1.0.0"
+description = "Finds your company's signature blocks in contract PDFs and stamps your signature and the date, locally."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.162.4",
+    "ollama>=0.6.3",
+    "openpyxl>=3.1.5",
+    "pillow>=13.0.0",
+    "pyhanko>=0.38.1",
+    "pymupdf>=2.1",
+    "python-multipart>=0.0.33",
+    "rapidfuzz>=3.14.6",
+    "uvicorn>=0.54.0",
+]
+
+[project.scripts]
+autosign = "autosign.app:main"
+
+[dependency-groups]
+dev = [
+    "httpx>=0.28.1",
+    "pytest>=9.2.0",
+]
+
+[build-system]
+requires = ["uv_build>=0.8.17,<0.9.0"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = "autosign"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["live: needs Ollama running with the model (run: uv run pytest -m live -s)"]
+addopts = "-m 'not live'"

@@ -1,0 +1,787 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AutoSignPDF</title>
+<style>
+/* Layout: a top bar with tabs, one view at a time, cards for groups. Plain CSS, no libraries. */
+:root {
+  --ink: #1d2433; --muted: #5b6474; --line: #d8dce4; --paper: #ffffff; --ground: #f2f4f7;
+  --accent: #2346a3; --accent-ink: #ffffff; --accent-soft: #e7ecfa;
+  --good: #1d7445; --good-soft: #e2f2e8; --warn: #8f5600; --warn-soft: #faefd9;
+  --bad: #b3261e; --bad-soft: #fbe5e3; --info-soft: #eef0f4;
+  --font: "Segoe UI", system-ui, -apple-system, sans-serif;
+  --mono: "Cascadia Mono", Consolas, ui-monospace, monospace;
+  --radius: 8px;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --ink: #e5e8ee; --muted: #a2aab8; --line: #343b48; --paper: #1a1f28; --ground: #11151c;
+    --accent: #8fa8ff; --accent-ink: #0f1420; --accent-soft: #222b44;
+    --good: #6fd29b; --good-soft: #17301f; --warn: #f0b75a; --warn-soft: #33270f;
+    --bad: #ff8a80; --bad-soft: #3a1714; --info-soft: #232934;
+    color-scheme: dark;
+  }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--ground); color: var(--ink); font: 14px/1.45 var(--font); }
+header { background: var(--paper); border-bottom: 1px solid var(--line); position: sticky; top: 0; z-index: 5; }
+.bar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 20px; max-width: 1280px; margin: 0 auto; padding: 10px 20px; }
+.brand { font-weight: 700; font-size: 17px; letter-spacing: 0.2px; }
+.brand small { font-weight: 400; color: var(--muted); font-size: 12px; margin-left: 6px; }
+nav { display: flex; flex-wrap: wrap; gap: 4px; }
+nav button { border: 0; background: none; color: var(--muted); padding: 7px 12px; border-radius: 6px; font: inherit; cursor: pointer; }
+nav button:hover { background: var(--info-soft); color: var(--ink); }
+nav button[aria-current="page"] { background: var(--accent-soft); color: var(--accent); font-weight: 600; }
+.count { display: inline-block; min-width: 18px; padding: 0 5px; border-radius: 9px; background: var(--warn-soft); color: var(--warn); font-size: 11px; font-weight: 700; text-align: center; }
+.status-chips { margin-left: auto; display: flex; gap: 6px; flex-wrap: wrap; }
+main { max-width: 1280px; margin: 0 auto; padding: 20px; display: grid; gap: 16px; }
+h1 { font-size: 20px; margin: 0; }
+h2 { font-size: 15px; margin: 0 0 10px; }
+h3 { font-size: 13px; margin: 14px 0 6px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.6px; }
+.card { background: var(--paper); border: 1px solid var(--line); border-radius: var(--radius); padding: 16px; min-width: 0; }
+.row { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+.grid-2 { display: grid; grid-template-columns: minmax(260px, 340px) 1fr; gap: 16px; align-items: start; }
+@media (max-width: 860px) { .grid-2 { grid-template-columns: 1fr; } }
+.tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 10px; }
+.tile { background: var(--paper); border: 1px solid var(--line); border-radius: var(--radius); padding: 12px 14px; }
+.tile b { display: block; font-size: 26px; font-variant-numeric: tabular-nums; }
+.tile span { color: var(--muted); font-size: 12px; }
+.muted { color: var(--muted); }
+.small { font-size: 12px; }
+.mono { font-family: var(--mono); font-size: 12px; }
+button.btn, label.btn, a.btn { border: 1px solid var(--line); background: var(--paper); color: var(--ink); padding: 7px 14px; border-radius: 6px; font: inherit; cursor: pointer; text-decoration: none; display: inline-block; }
+button.btn:hover, label.btn:hover, a.btn:hover { border-color: var(--accent); }
+button.primary, a.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); font-weight: 600; }
+button.danger { color: var(--bad); }
+button:disabled { opacity: 0.5; cursor: not-allowed; }
+button:focus-visible, input:focus-visible, select:focus-visible, label.btn:focus-within { outline: 2px solid var(--accent); outline-offset: 2px; }
+.chip { display: inline-block; padding: 2px 9px; border-radius: 999px; font-size: 12px; font-weight: 600; background: var(--info-soft); color: var(--muted); white-space: nowrap; }
+.chip.good, .st-signed { background: var(--good-soft); color: var(--good); }
+.chip.warn, .st-review, .st-queued, .st-processing { background: var(--warn-soft); color: var(--warn); }
+.chip.bad, .st-rejected, .st-failed, .st-refused { background: var(--bad-soft); color: var(--bad); }
+.st-duplicate, .st-skipped { background: var(--info-soft); color: var(--muted); }
+table { width: 100%; border-collapse: collapse; }
+th, td { text-align: left; padding: 7px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
+th { font-size: 12px; color: var(--muted); font-weight: 600; }
+td { font-variant-numeric: tabular-nums; }
+tr.clickable { cursor: pointer; }
+tr.clickable:hover td, tr.selected td { background: var(--accent-soft); }
+.table-wrap { overflow-x: auto; }
+.list { display: grid; gap: 6px; }
+.list button { text-align: left; border: 1px solid var(--line); background: var(--paper); color: var(--ink); border-radius: 6px; padding: 9px 10px; font: inherit; cursor: pointer; }
+.list button[aria-current="true"] { border-color: var(--accent); background: var(--accent-soft); }
+.list button .small { display: block; color: var(--muted); margin-top: 2px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.drop { border: 2px dashed var(--line); border-radius: var(--radius); padding: 36px 16px; text-align: center; background: var(--paper); }
+.drop.over { border-color: var(--accent); background: var(--accent-soft); }
+.reasons { margin: 6px 0 0; padding-left: 18px; }
+.reasons li { margin: 2px 0; }
+.checks { list-style: none; padding: 0; margin: 0; display: grid; gap: 4px; }
+.checks li { display: grid; grid-template-columns: 22px 1fr; gap: 6px; }
+.checks .ok { color: var(--good); font-weight: 700; }
+.checks .no { color: var(--bad); font-weight: 700; }
+.kv { display: grid; grid-template-columns: max-content 1fr; gap: 4px 14px; margin: 0; }
+.kv dt { color: var(--muted); }
+.kv dd { margin: 0; min-width: 0; overflow-wrap: anywhere; }
+.preview-wrap { overflow: auto; border: 1px solid var(--line); border-radius: 6px; background: var(--ground); max-height: 820px; }
+.preview { position: relative; display: inline-block; line-height: 0; }
+.preview img { display: block; max-width: none; }
+.preview.placing img { cursor: crosshair; }
+.mark { position: absolute; border: 2px solid var(--good); background: rgba(40, 170, 90, 0.18); pointer-events: none; }
+.mark.date { border-color: var(--accent); background: rgba(60, 100, 230, 0.18); }
+.actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-top: 12px; }
+input[type="text"], input[type="number"], select { border: 1px solid var(--line); background: var(--paper); color: var(--ink); border-radius: 6px; padding: 7px 9px; font: inherit; min-width: 0; }
+form.settings { display: grid; grid-template-columns: minmax(180px, 260px) 1fr; gap: 10px 16px; align-items: center; }
+form.settings .hint { grid-column: 2; margin-top: -6px; }
+@media (max-width: 640px) { form.settings { grid-template-columns: 1fr; } form.settings .hint { grid-column: 1; } }
+.types { display: flex; flex-wrap: wrap; gap: 6px 14px; }
+.sig-box { background: repeating-conic-gradient(var(--info-soft) 0% 25%, var(--paper) 0% 50%) 0 0 / 16px 16px; border: 1px solid var(--line); border-radius: 6px; padding: 12px; display: inline-block; }
+.sig-box img { max-height: 90px; max-width: 100%; display: block; }
+#toast { position: fixed; right: 20px; bottom: 20px; max-width: 460px; padding: 12px 16px; border-radius: 8px; background: var(--ink); color: var(--paper); box-shadow: 0 6px 24px rgba(0,0,0,0.2); z-index: 20; }
+#toast.bad { background: var(--bad); color: #fff; }
+.empty { color: var(--muted); padding: 18px 4px; }
+[hidden] { display: none !important; }
+</style>
+</head>
+<body>
+<header>
+  <div class="bar">
+    <div class="brand">AutoSignPDF <small>local signing desk</small></div>
+    <nav aria-label="Views">
+      <button type="button" data-view="dashboard" aria-current="page">Dashboard</button>
+      <button type="button" data-view="upload">Upload</button>
+      <button type="button" data-view="review">Review <span class="count" id="review-count" hidden>0</span></button>
+      <button type="button" data-view="history">History</button>
+      <button type="button" data-view="settings">Settings</button>
+    </nav>
+    <div class="status-chips" id="status-chips"></div>
+  </div>
+</header>
+
+<main>
+  <!-- Dashboard -->
+  <section id="view-dashboard" class="view">
+    <div class="row" style="justify-content: space-between">
+      <h1>Today</h1>
+      <div class="row">
+        <button type="button" class="btn" id="inbox-button">Process inbox</button>
+        <button type="button" class="btn" id="export-button">Export to Excel</button>
+      </div>
+    </div>
+    <div class="tiles" id="tiles"></div>
+    <div class="grid-2">
+      <div class="card">
+        <h2>System</h2>
+        <dl class="kv" id="system"></dl>
+      </div>
+      <div class="card">
+        <h2>Recent documents</h2>
+        <div class="table-wrap" id="recent"></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Upload -->
+  <section id="view-upload" class="view" hidden>
+    <h1>Upload contracts</h1>
+    <div class="drop" id="drop">
+      <p><strong>Drop PDF files here</strong></p>
+      <p class="muted">or</p>
+      <label class="btn">Choose files<input type="file" id="file-input" accept="application/pdf,.pdf" multiple hidden></label>
+      <p class="muted small" id="inbox-hint"></p>
+    </div>
+    <div class="card">
+      <h2>This session</h2>
+      <div class="table-wrap" id="uploads"><p class="empty">Nothing uploaded yet. Each file you add appears here with its progress.</p></div>
+    </div>
+  </section>
+
+  <!-- Review -->
+  <section id="view-review" class="view" hidden>
+    <h1>Waiting for review</h1>
+    <div class="grid-2">
+      <div class="list" id="review-list"></div>
+      <div id="review-detail" class="card"><p class="empty">Select a document to review it.</p></div>
+    </div>
+  </section>
+
+  <!-- History -->
+  <section id="view-history" class="view" hidden>
+    <div class="row" style="justify-content: space-between">
+      <h1>History</h1>
+      <div class="row">
+        <input type="text" id="history-search" placeholder="Search file, job or party" aria-label="Search">
+        <select id="history-status" aria-label="Status">
+          <option value="">All statuses</option>
+          <option>signed</option><option>review</option><option>rejected</option>
+          <option>failed</option><option>duplicate</option><option>queued</option><option>processing</option>
+        </select>
+        <button type="button" class="btn" id="history-export">Export to Excel</button>
+        <button type="button" class="btn" id="audit-button">Verify audit log</button>
+      </div>
+    </div>
+    <div class="card"><div class="table-wrap" id="history-table"></div></div>
+    <div id="history-detail" class="card" hidden></div>
+  </section>
+
+  <!-- Settings -->
+  <section id="view-settings" class="view" hidden>
+    <h1>Settings</h1>
+    <div class="card">
+      <form class="settings" id="settings-form">
+        <label for="s-company">Company legal name</label>
+        <input type="text" id="s-company" required>
+        <label for="s-aliases">Other names</label>
+        <input type="text" id="s-aliases">
+        <span class="hint muted small">Comma-separated, for example: Acme Analytics, ACME</span>
+        <label for="s-roles">Roles you usually have</label>
+        <input type="text" id="s-roles">
+        <span class="hint muted small">Used only to propose a spot when your name isn't in the document. Proposals like that always wait for review.</span>
+        <label for="s-signer">Signer's name</label>
+        <input type="text" id="s-signer">
+        <span class="hint muted small">The person whose signature is stamped. Optional; a block that prints this name counts as yours.</span>
+        <label for="s-signature">Signature image file</label>
+        <input type="text" id="s-signature" required>
+        <span class="hint muted small">Read fresh on every signing, relative to the project folder. Default: data/signature.png</span>
+        <label for="s-date">Date format</label>
+        <input type="text" id="s-date" required>
+        <span class="hint muted small" id="s-date-example"></span>
+        <label for="s-auto">Auto-sign</label>
+        <label><input type="checkbox" id="s-auto"> Sign automatically when all 8 checks pass. Off means shadow mode: everything waits for review.</label>
+        <span>Document types for auto-sign</span>
+        <div class="types" id="s-types"></div>
+        <label for="s-require">Require your company name</label>
+        <label><input type="checkbox" id="s-require"> Auto-sign only when your company's name is in the document. Off: your roles, the one party left unnamed, and the blocks still empty after the client signed also count as proof.</label>
+        <label for="s-max">Most blocks per document</label>
+        <input type="number" id="s-max" min="1" max="20">
+        <span class="hint muted small">Every block that is yours is signed, each with its own date. A document with more of your blocks than this goes to review.</span>
+        <label for="s-model">AI model</label>
+        <select id="s-model"></select>
+        <label for="s-ctx">AI context size (tokens)</label>
+        <input type="number" id="s-ctx" min="2048" max="131072" step="1024">
+        <span class="hint muted small">Sent with every AI request. Larger uses more GPU memory; a document's prompt is usually under 5,000 tokens.</span>
+        <label for="s-flatten">Flatten form after signing</label>
+        <label><input type="checkbox" id="s-flatten"> Turn form fields into plain text so nobody can edit them later (unsigned PDFs only).</label>
+        <label for="s-pages">Limits</label>
+        <div class="row"><input type="number" id="s-pages" min="1" max="5000" aria-label="Max pages"> pages <input type="number" id="s-mb" min="1" max="2000" aria-label="Max MB"> MB</div>
+        <span></span>
+        <div class="row"><button type="submit" class="btn primary">Save settings</button></div>
+      </form>
+    </div>
+    <div class="card">
+      <h2>Signature image</h2>
+      <p class="muted small" id="signature-status"></p>
+      <div class="row" style="align-items: flex-end">
+        <div class="sig-box" id="signature-box"><img id="signature-image" alt="Your signature as it will be stamped"></div>
+        <label class="btn">Replace signature image<input type="file" id="signature-input" accept="image/png,image/jpeg" hidden></label>
+      </div>
+      <p class="muted small">Shown as it will be stamped: background removed and cropped to the ink. The AI never sees it. Replacing it keeps a copy of the old file in storage/signature-backups.</p>
+      <p class="mono muted" id="signature-meta"></p>
+    </div>
+  </section>
+</main>
+
+<div id="toast" role="status" hidden></div>
+
+<script>
+const state = { view: "dashboard", reviewId: null, historyId: null, uploads: [], settings: null, placing: null };
+const FINAL = ["signed", "rejected", "failed", "duplicate", "refused", "skipped"];
+
+// ---------------------------------------------------------------- helpers
+async function api(path, options = {}) {
+  // The app refuses changes that don't come from this page; the header marks them as ours.
+  const response = await fetch(path, { ...options, headers: { ...(options.headers || {}), "X-AutoSign": "1" } });
+  const type = response.headers.get("content-type") || "";
+  const body = type.includes("application/json") ? await response.json() : await response.text();
+  if (!response.ok) {
+    let message = typeof body === "object" ? body.detail : body;
+    if (typeof message !== "string") message = JSON.stringify(message);
+    throw new Error(message || response.statusText);
+  }
+  return body;
+}
+
+function esc(value) {
+  return String(value ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+
+function toast(message, bad = false) {
+  const box = document.getElementById("toast");
+  box.textContent = message;
+  box.className = bad ? "bad" : "";
+  box.hidden = false;
+  clearTimeout(toast.timer);
+  toast.timer = setTimeout(() => { box.hidden = true; }, bad ? 9000 : 4000);
+}
+
+function statusChip(status) {
+  return `<span class="chip st-${esc(status)}">${esc(status)}</span>`;
+}
+
+function postJSON(path, body) {
+  return api(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body || {}) });
+}
+
+async function run(action) {
+  try { await action(); } catch (error) { toast(error.message, true); }
+}
+
+// ---------------------------------------------------------------- navigation
+function show(view) {
+  state.view = view;
+  history.replaceState(null, "", `#${view}`);
+  for (const section of document.querySelectorAll(".view")) section.hidden = section.id !== `view-${view}`;
+  for (const button of document.querySelectorAll("nav button")) {
+    if (button.dataset.view === view) button.setAttribute("aria-current", "page");
+    else button.removeAttribute("aria-current");
+  }
+  refresh();
+}
+
+function refresh() {
+  if (state.view === "dashboard") run(loadDashboard);
+  if (state.view === "upload") run(pollUploads);
+  if (state.view === "review") run(loadReview);
+  if (state.view === "history") run(loadHistory);
+  if (state.view === "settings") run(loadSettings);
+}
+
+// ---------------------------------------------------------------- dashboard and status
+async function loadStatus() {
+  const health = await api("/api/health");
+  const ollama = health.ollama;
+  let ai = `<span class="chip bad">AI offline</span>`;
+  if (ollama.reachable) ai = ollama.model_installed ? `<span class="chip good">AI ready: ${esc(ollama.model)}</span>`
+                                                   : `<span class="chip bad">Model missing: ${esc(ollama.model)}</span>`;
+  const auto = health.auto_sign ? `<span class="chip good">Auto-sign on</span>` : `<span class="chip warn">Shadow mode</span>`;
+  const signature = health.signature.found ? "" : `<span class="chip bad" title="${esc(health.signature.error)}">No signature image</span>`;
+  document.getElementById("status-chips").innerHTML = ai + auto + signature;
+  const reviews = await api("/api/jobs?status=review&limit=500");
+  const count = document.getElementById("review-count");
+  count.textContent = reviews.jobs.length;
+  count.hidden = reviews.jobs.length === 0;
+  return health;
+}
+
+async function loadDashboard() {
+  const [summary, health] = await Promise.all([api("/api/summary"), loadStatus()]);
+  const t = summary.today;
+  const tiles = [["Auto-signed", t.auto_signed], ["Approved and signed", t.approved], ["Waiting for review", t.review],
+                 ["Rejected", t.rejected], ["Failed", t.failed], ["In the queue", t.queued]];
+  document.getElementById("tiles").innerHTML = tiles.map(([label, n]) => `<div class="tile"><b>${n}</b><span>${label}</span></div>`).join("");
+  const o = health.ollama;
+  const rows = [
+    ["Ollama", o.reachable ? "reachable" : `not running: start Ollama, then reload this page (${esc(o.error)})`],
+    ["Model", !o.reachable ? esc(o.model || "") : `${esc(o.model || "")} ${o.model_installed ? "" : "(not installed: run ollama pull " + esc(o.model || "") + ")"}`],
+    ["Loaded on GPU", o.model_loaded ? `${o.vram_gb} GB (${Math.round((o.on_gpu_share || 0) * 100)}% on the GPU)` : "not loaded yet (loads with the first document)"],
+    ["Auto-sign", health.auto_sign ? "on: documents that pass all 8 checks are signed" : "off (shadow mode): every document waits for review"],
+    ["Signature image", health.signature.found ? `${esc(health.signature.path)}` : `<span class="chip bad">missing</span> ${esc(health.signature.error)}`],
+    ["Signed PDFs go to", esc(health.output)],
+    ["Worker", health.worker_running ? `running, ${health.queued} queued` : "stopped"],
+    ["All time", `${summary.all_time.total} documents, ${summary.all_time.signed} signed`],
+  ];
+  document.getElementById("system").innerHTML = rows.map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join("");
+  document.getElementById("recent").innerHTML = jobTable(summary.recent, "dashboard");
+  bindJobRows(document.getElementById("recent"));
+}
+
+function jobTable(jobs, where) {
+  if (!jobs.length) return `<p class="empty">No documents yet. Upload a PDF, or put files in the inbox folder and click Process inbox.</p>`;
+  return `<table><thead><tr><th>Job</th><th>File</th><th>Status</th><th>Type</th><th>Where it signed</th><th>Received</th></tr></thead><tbody>` +
+    jobs.map(j => `<tr class="clickable" data-job="${esc(j.job_id)}" data-status="${esc(j.status)}"><td class="mono">${esc(j.job_id)}</td><td>${esc(j.filename)}</td>
+      <td>${statusChip(j.status)}${j.decision ? ` <span class="muted small">${esc(j.decision)}</span>` : ""}</td><td>${esc(j.doc_type || "")}</td>
+      <td class="small">${esc(j.signed_where || (j.reasons || [])[0] || "")}</td><td class="small muted">${esc(j.received_at || "")}</td></tr>`).join("") +
+    `</tbody></table>`;
+}
+
+function bindJobRows(container) {
+  for (const row of container.querySelectorAll("tr[data-job]")) {
+    row.addEventListener("click", () => {
+      if (row.dataset.status === "review") { state.reviewId = row.dataset.job; show("review"); }
+      else { state.historyId = row.dataset.job; show("history"); }
+    });
+  }
+}
+
+async function processInbox() {
+  const result = await api("/api/inbox/process", { method: "POST" });
+  if (!result.jobs.length) { toast(`The inbox is empty (${result.inbox}).`); return; }
+  state.uploads = result.jobs.concat(state.uploads);
+  toast(result.jobs.map(j => `${j.filename}: ${j.status}`).join("; "));
+  refresh();
+}
+
+function exportExcel() { window.location.href = "/api/ledger/export.xlsx"; }
+
+// ---------------------------------------------------------------- upload
+async function uploadFiles(files) {
+  const pdfs = [...files].filter(f => f.name.toLowerCase().endsWith(".pdf"));
+  if (!pdfs.length) { toast("Only PDF files can be uploaded.", true); return; }
+  const form = new FormData();
+  for (const file of pdfs) form.append("files", file);
+  form.append("source", "gui");
+  const result = await api("/api/documents", { method: "POST", body: form });
+  state.uploads = result.jobs.concat(state.uploads);
+  renderUploads();
+}
+
+function renderUploads() {
+  const box = document.getElementById("uploads");
+  if (!state.uploads.length) return;
+  box.innerHTML = `<table><thead><tr><th>Job</th><th>File</th><th>Status</th><th>Notes</th></tr></thead><tbody>` +
+    state.uploads.map(j => `<tr ${j.job_id ? `class="clickable" data-job="${esc(j.job_id)}" data-status="${esc(j.status)}"` : ""}>
+      <td class="mono">${esc(j.job_id || "-")}</td><td>${esc(j.filename)}</td><td>${statusChip(j.status)}</td>
+      <td class="small">${esc((j.reasons || [])[0] || (j.signed_where ? "Signed at " + j.signed_where : ""))}</td></tr>`).join("") +
+    `</tbody></table>`;
+  bindJobRows(box);
+}
+
+async function pollUploads() {
+  const open = state.uploads.filter(j => j.job_id && !FINAL.includes(j.status) && j.status !== "review");
+  for (const job of open) Object.assign(job, await api(`/api/jobs/${job.job_id}`));
+  renderUploads();
+}
+
+// ---------------------------------------------------------------- review and job detail
+async function loadReview() {
+  const { jobs } = await api("/api/jobs?status=review&limit=500");
+  const list = document.getElementById("review-list");
+  if (!jobs.length) {
+    list.innerHTML = `<p class="empty">Nothing is waiting for review.</p>`;
+    document.getElementById("review-detail").innerHTML = `<p class="empty">Select a document to review it.</p>`;
+    state.reviewId = null;
+    return;
+  }
+  if (!jobs.some(j => j.job_id === state.reviewId)) state.reviewId = jobs[0].job_id;
+  list.innerHTML = jobs.map(j => `<button type="button" data-job="${esc(j.job_id)}" aria-current="${j.job_id === state.reviewId}">
+      <strong>${esc(j.filename)}</strong><span class="small">${esc(j.job_id)} · ${esc((j.reasons || [])[0] || "")}</span></button>`).join("");
+  for (const button of list.querySelectorAll("button")) {
+    button.addEventListener("click", () => { state.reviewId = button.dataset.job; state.placing = null; run(loadReview); });
+  }
+  const detail = document.getElementById("review-detail");
+  if (detail.dataset.job !== state.reviewId || !state.placing) await openJob(state.reviewId, detail);
+}
+
+async function openJob(jobId, container) {
+  const job = await api(`/api/jobs/${jobId}`);
+  container.dataset.job = jobId;
+  container.hidden = false;
+  renderDetail(job, container);
+}
+
+// Records made before multi-block signing held single values; newer ones hold lists.
+function asList(value) {
+  if (Array.isArray(value)) return value;
+  return value === null || value === undefined || value === "" ? [] : [value];
+}
+
+function renderDetail(job, el) {
+  const record = job.record || {};
+  const analysis = record.analysis || {};
+  const verdict = record.verdict || {};
+  const ai = record.ai || {};
+  const signing = record.signing || {};
+  const spots = analysis.spots || [];
+  const pages = analysis.pages || [];
+  const editable = job.status === "review";
+  const proposal = asList(verdict.proposal);
+  const proposedIds = proposal.map(p => p.spot);
+  const rulesIds = asList(verdict.rules_pick);
+  const aiPicks = ai.ok ? (ai.answer.picks || (ai.answer.signature_spot ? [ai.answer] : [])) : [];
+  const aiIds = aiPicks.map(p => p.signature_spot);
+  const signedPlacements = signing.placements || asList(signing.placement);
+  const spotPages = [...new Set(spots.map(s => s.page))];
+  const proposalSpot = spots.find(s => s.id === proposedIds[0]);
+  const firstPage = (signedPlacements[0] && signedPlacements[0].page) || (proposalSpot ? proposalSpot.page : (spotPages[0] || pages.length || 1));
+  const parties = analysis.parties || {};
+
+  const info = [
+    ["Job", `<span class="mono">${esc(job.job_id)}</span> ${statusChip(job.status)} ${job.decision ? esc(job.decision) : ""}`],
+    ["Document type", esc(analysis.doc_type || job.doc_type || "")],
+    ["Parties", esc(job.parties || (parties.roles || []).join(", ") || "not found")],
+    ["Your role", esc(parties.our_role || (parties.our_name_found ? "not defined in the document" : "your company's name was not found"))],
+    ["Client signatures", analysis.signatures && analysis.signatures.length
+        ? esc(analysis.signatures.map(s => `${s.signer}${s.certification ? ` (certified, lock level ${s.lock_level})` : ""}`).join("; "))
+        : "none"],
+    ["Pages", esc(job.pages ?? analysis.page_count ?? "")],
+  ];
+  if (job.signed_where) info.push(["Signed at", esc(job.signed_where)], ["Date", esc(job.date_filled || "not filled")],
+                                  ["Saved to", esc(job.output_path || "")]);
+  if (job.reviewer) info.push(["Reviewer", esc(job.reviewer)]);
+
+  const reasons = (job.reasons || []).length ? `<ul class="reasons">${job.reasons.map(r => `<li>${esc(r)}</li>`).join("")}</ul>` : "";
+  const notes = (analysis.notes || []).length ? `<h3>Notes</h3><ul class="reasons">${analysis.notes.map(n => `<li>${esc(n)}</li>`).join("")}</ul>` : "";
+  const checks = (verdict.checks || []).length ? `<h3>The 8 checks</h3><ul class="checks">${verdict.checks.map(c =>
+      `<li><span class="${c.passed ? "ok" : "no"}">${c.passed ? "✓" : "✗"}</span><span><strong>${c.number}. ${esc(c.title)}</strong> <span class="muted small">${esc(c.detail)}</span></span></li>`).join("")}</ul>` : "";
+  let aiText = "not run";
+  if (ai.ok) {
+    const picked = aiPicks.length ? aiPicks.map(p => `spot ${p.signature_spot} (date ${p.date_spot || "none"}, quote "${esc(p.quote)}")`).join("; ") : "no spot";
+    aiText = `picked ${picked}; type ${esc(ai.answer.document_type)}, role "${esc(ai.answer.our_role)}" (${ai.seconds} s, ${esc(ai.model)})`;
+  } else if (ai.error) aiText = esc(ai.error);
+  const aiLooks = asList(signing.ai_check).map(a => `spot ${a.spot_id ?? ""}: ${esc(a.detail || a.error || "")}`).join("; ");
+  const postChecks = (signing.checks || []).length ? `<h3>Checks on the signed copy</h3><ul class="checks">${signing.checks.map(c =>
+      `<li><span class="${c.passed ? "ok" : "no"}">${c.passed ? "✓" : "✗"}</span><span>${esc(c.title)} <span class="muted small">${esc(c.detail)}</span></span></li>`).join("")}</ul>` +
+      (aiLooks ? `<p class="small muted">AI look at the signed page: ${aiLooks}</p>` : "") : "";
+
+  const spotRows = spots.map(s => {
+    const owner = { ours: "good", theirs: "bad", never: "bad" }[s.owner] || "";
+    const marker = [proposedIds.includes(s.id) ? "proposal" : "", rulesIds.includes(s.id) ? "rules" : "", aiIds.includes(s.id) ? "AI" : ""].filter(Boolean).join(", ");
+    const pickable = editable && s.kind === "signature" && s.placement && s.placement.fits;
+    return `<tr><td>${pickable ? `<input type="checkbox" name="spot-${esc(job.job_id)}" value="${s.id}" aria-label="Spot ${s.id}" ${proposedIds.includes(s.id) ? "checked" : ""}>` : ""}</td>
+      <td class="mono">${s.id}</td><td>${s.page}</td><td>${esc(s.label)}<div class="small muted">${esc(s.block_text)}</div></td>
+      <td><span class="chip ${owner}">${esc(s.owner)}</span><div class="small muted">${esc(s.owner_reason)}</div></td>
+      <td class="mono">${s.date_id || "-"}</td><td class="small">${s.placement && s.placement.fits ? "fits" : esc((s.placement || {}).reason || "")}</td>
+      <td class="small">${esc(marker)}</td></tr>`;
+  }).join("");
+  const spotTable = spots.length ? `<h3>Signature spots found</h3><div class="table-wrap"><table><thead><tr><th></th><th>#</th><th>Page</th><th>Label and block text</th><th>Owner</th><th>Date</th><th>Stamp</th><th>Picked by</th></tr></thead><tbody>${spotRows}</tbody></table></div>` : `<h3>Signature spots found</h3><p class="muted">None. You can place the signature by hand.</p>`;
+
+  const pageOptions = Array.from({ length: Math.max(pages.length, 1) }, (_, i) => i + 1)
+    .map(n => `<option value="${n}" ${n === firstPage ? "selected" : ""}>Page ${n}${spotPages.includes(n) ? " (spots)" : ""}</option>`).join("");
+  const views = job.status === "signed" ? `<option value="signed">Signed copy</option><option value="proposal">Original with spots</option>` : `<option value="proposal">With spots and proposal</option><option value="plain">Plain page</option>`;
+
+  let actions = "";
+  if (editable) {
+    const approveText = proposal.length ? `Approve: sign spot${proposal.length > 1 ? "s" : ""} ${proposedIds.join(", ")}` : "No proposal to approve";
+    actions = `<div class="actions">
+        <button type="button" class="btn primary" data-act="approve" ${proposal.length ? "" : "disabled"}>${approveText}</button>
+        <button type="button" class="btn" data-act="pick" ${spots.some(s => s.kind === "signature" && s.placement && s.placement.fits) ? "" : "disabled"}>Sign the ticked spots</button>
+        <label class="small"><input type="checkbox" data-role="fill-dates" checked> Fill the date in each block</label>
+        <button type="button" class="btn" data-act="place">Place by hand</button>
+        <button type="button" class="btn" data-act="rerun">Re-run</button>
+      </div>
+      <div class="actions" data-role="placing" hidden>
+        <span class="small" data-role="placing-text">Click the page where the signature should go.</span>
+        <button type="button" class="btn" data-act="add-place" disabled>Add this signature</button>
+        <button type="button" class="btn primary" data-act="sign-here" disabled>Sign all placed</button>
+        <button type="button" class="btn" data-act="cancel-place">Cancel</button>
+      </div>
+      <div class="actions">
+        <input type="text" data-role="reason" placeholder="Reason for rejecting" aria-label="Reason for rejecting" style="flex: 1; min-width: 200px">
+        <button type="button" class="btn danger" data-act="reject">Reject</button>
+      </div>`;
+  } else if (job.status === "signed") {
+    actions = `<div class="actions"><a class="btn primary" href="/api/jobs/${esc(job.job_id)}/download">Download signed PDF</a>
+      <a class="btn" href="/api/jobs/${esc(job.job_id)}/original">Original</a></div>`;
+  } else if (job.status === "failed") {
+    actions = `<div class="actions"><button type="button" class="btn" data-act="rerun">Re-run</button>
+      <input type="text" data-role="reason" placeholder="Reason for rejecting" aria-label="Reason for rejecting" style="flex: 1; min-width: 200px">
+      <button type="button" class="btn danger" data-act="reject">Reject</button></div>`;
+  } else if (job.status === "rejected" && job.decision !== "rejected") {
+    actions = `<div class="actions"><button type="button" class="btn" data-act="rerun">Re-run</button></div>`;
+  }
+
+  el.innerHTML = `<h2>${esc(job.filename)}</h2>${reasons}
+    <dl class="kv" style="margin-top: 10px">${info.map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join("")}<dt>AI</dt><dd class="small">${aiText}</dd></dl>
+    ${actions}${checks}${postChecks}${notes}${spotTable}
+    <h3>Page</h3>
+    <div class="row" style="margin-bottom: 8px"><select data-role="page" aria-label="Page">${pageOptions}</select><select data-role="view" aria-label="View">${views}</select>
+      <span class="small muted">Green = your block, red = other party, blue = date. Dashed boxes are the numbered spots.</span></div>
+    <div class="preview-wrap"><div class="preview"><img data-role="image" alt="Page preview"><div data-role="marks"></div></div></div>`;
+  bindDetail(job, el, pages);
+}
+
+function bindDetail(job, el, pages) {
+  const q = selector => el.querySelector(selector);
+  const image = q('[data-role="image"]');
+  const pageSelect = q('[data-role="page"]');
+  const viewSelect = q('[data-role="view"]');
+  const loadImage = () => {
+    const page = Number(pageSelect.value);
+    image.src = `/api/jobs/${encodeURIComponent(job.job_id)}/pages/${page}/preview?view=${viewSelect.value}&t=${Date.now()}`;
+    drawMarks();
+  };
+  pageSelect.addEventListener("change", () => { if (placingHere()) placingHere().current = { sig: null, date: null }; loadImage(); updatePlacing(); });
+  viewSelect.addEventListener("change", loadImage);
+  image.addEventListener("load", drawMarks);
+
+  const spots = ((job.record || {}).analysis || {}).spots || [];
+  const pageSize = () => pages[Number(pageSelect.value) - 1] || { width: 612, height: 792, rotation: 0 };
+  // Placing by hand: state.placing = { jobId, items: [placed signatures], current: { sig, date } }.
+  function placingHere() { return state.placing && state.placing.jobId === job.job_id ? state.placing : null; }
+  function toPoints(event) {
+    const box = image.getBoundingClientRect();
+    const size = pageSize();
+    return { x: (event.clientX - box.left) / box.width * size.width, y: (event.clientY - box.top) / box.height * size.height };
+  }
+  function drawMarks() {
+    const layer = q('[data-role="marks"]');
+    layer.innerHTML = "";
+    const placing = placingHere();
+    if (!placing || !image.clientWidth) return;
+    const page = Number(pageSelect.value);
+    const scale = image.clientWidth / pageSize().width;
+    const aspect = state.settings ? state.settings.signature.aspect : 3.5;
+    const box = (cls, x, y, w, h) => {
+      const div = document.createElement("div");
+      div.className = cls;
+      Object.assign(div.style, { left: `${x * scale}px`, top: `${y * scale}px`, width: `${w * scale}px`, height: `${h * scale}px` });
+      layer.appendChild(div);
+    };
+    const items = placing.items.filter(i => i.page === page).map(i => ({ sig: { x: i.x, y: i.y }, date: i.date_x != null ? { x: i.date_x, y: i.date_y } : null }));
+    items.push(placing.current);
+    for (const item of items) {
+      if (item.sig) box("mark", item.sig.x - 16 * aspect, item.sig.y - 16, 32 * aspect, 32);
+      if (item.date) box("mark date", item.date.x, item.date.y - 10, 62, 12);
+    }
+  }
+  function updatePlacing() {
+    const bar = q('[data-role="placing"]');
+    if (!bar) return;
+    const placing = placingHere();
+    bar.hidden = !placing;
+    q(".preview").classList.toggle("placing", Boolean(placing));
+    if (!placing) { drawMarks(); return; }
+    const total = placing.items.length + (placing.current.sig ? 1 : 0);
+    q('[data-act="add-place"]').disabled = !placing.current.sig;
+    q('[data-act="sign-here"]').disabled = total === 0;
+    q('[data-act="sign-here"]').textContent = `Sign all placed (${total})`;
+    q('[data-role="placing-text"]').textContent = !placing.current.sig
+      ? `Click the page where a signature should go (its centre).${placing.items.length ? ` ${placing.items.length} placed so far.` : ""}`
+      : !placing.current.date ? "Optional: click where its date should start, on the date line. Then add it, or sign."
+      : "Click again to move the date, or add this signature and place another.";
+    drawMarks();
+  }
+  image.addEventListener("click", event => {
+    const placing = placingHere();
+    if (!placing) return;
+    if (pageSize().rotation) { toast("Placing by hand isn't supported on rotated pages.", true); return; }
+    const point = toPoints(event);
+    if (!placing.current.sig) placing.current.sig = point; else placing.current.date = point;
+    updatePlacing();
+  });
+  function takeCurrent() {
+    const placing = placingHere();
+    const c = placing.current;
+    if (!c.sig) return;
+    const item = { page: Number(pageSelect.value), x: c.sig.x, y: c.sig.y };
+    if (c.date) { item.date_x = c.date.x; item.date_y = c.date.y; }
+    placing.items.push(item);
+    placing.current = { sig: null, date: null };
+  }
+
+  const act = (name, handler) => { const button = q(`[data-act="${name}"]`); if (button) button.addEventListener("click", () => run(handler)); };
+  const done = async (message) => {
+    state.placing = null;
+    for (const id of ["review-detail", "history-detail"]) document.getElementById(id).dataset.job = "";   // redraw with the new status
+    toast(message);
+    await loadStatus();
+    refresh();
+  };
+  act("approve", async () => { const r = await postJSON(`/api/jobs/${job.job_id}/approve`); await done(`Signed: ${r.signed_where}`); });
+  act("pick", async () => {
+    const ticked = [...el.querySelectorAll(`input[name="spot-${CSS.escape(job.job_id)}"]:checked`)].map(box => Number(box.value));
+    if (!ticked.length) { toast("Tick at least one spot in the table first.", true); return; }
+    const fillDates = q('[data-role="fill-dates"]').checked;
+    const chosen = ticked.map(id => ({ spot: id, date: fillDates ? (spots.find(s => s.id === id) || {}).date_id || null : null }));
+    const r = await postJSON(`/api/jobs/${job.job_id}/adjust`, { spots: chosen });
+    await done(`Signed: ${r.signed_where}`);
+  });
+  act("place", async () => { state.placing = { jobId: job.job_id, items: [], current: { sig: null, date: null } }; updatePlacing(); });
+  act("add-place", async () => { takeCurrent(); updatePlacing(); });
+  act("cancel-place", async () => { state.placing = null; updatePlacing(); });
+  act("sign-here", async () => {
+    takeCurrent();
+    const r = await postJSON(`/api/jobs/${job.job_id}/adjust`, { placements: placingHere().items });
+    await done(`Signed: ${r.signed_where}`);
+  });
+  act("reject", async () => {
+    const reason = q('[data-role="reason"]').value.trim();
+    await postJSON(`/api/jobs/${job.job_id}/reject`, { reason });
+    await done("Rejected.");
+  });
+  act("rerun", async () => { await postJSON(`/api/jobs/${job.job_id}/rerun`); await done("Queued again with the current settings."); });
+  // Ticking a spot shows its page.
+  for (const tick of el.querySelectorAll(`input[name="spot-${CSS.escape(job.job_id)}"]`)) {
+    tick.addEventListener("change", () => {
+      const spot = spots.find(s => s.id === Number(tick.value));
+      if (spot && tick.checked && Number(pageSelect.value) !== spot.page) { pageSelect.value = String(spot.page); loadImage(); }
+    });
+  }
+  loadImage();
+  updatePlacing();
+}
+
+// ---------------------------------------------------------------- history
+async function loadHistory() {
+  const q = document.getElementById("history-search").value.trim();
+  const status = document.getElementById("history-status").value;
+  const { jobs } = await api(`/api/jobs?q=${encodeURIComponent(q)}&status=${encodeURIComponent(status)}&limit=500`);
+  const box = document.getElementById("history-table");
+  box.innerHTML = jobTable(jobs, "history");
+  for (const row of box.querySelectorAll("tr[data-job]")) {
+    row.classList.toggle("selected", row.dataset.job === state.historyId);
+    row.addEventListener("click", () => { state.historyId = row.dataset.job; state.placing = null; run(loadHistory); });
+  }
+  const detail = document.getElementById("history-detail");
+  if (state.historyId && detail.dataset.job !== state.historyId) await openJob(state.historyId, detail);
+}
+
+async function verifyAudit() {
+  const result = await api("/api/audit/verify");
+  toast(result.ok ? `Audit log intact: ${result.detail}.` : `Audit log broken: ${result.detail}.`, !result.ok);
+}
+
+// ---------------------------------------------------------------- settings
+async function loadSettings() {
+  const data = await api("/api/settings");
+  state.settings = data;
+  const s = data.settings;
+  document.getElementById("s-company").value = s.company_name;
+  document.getElementById("s-aliases").value = s.company_aliases.join(", ");
+  document.getElementById("s-roles").value = s.usual_roles.join(", ");
+  document.getElementById("s-signer").value = s.signer_name;
+  document.getElementById("s-date").value = s.date_format;
+  document.getElementById("s-date-example").textContent = `Today: ${data.date_example}. Codes: %b Nov, %B November, %d day, %m month, %Y year.`;
+  document.getElementById("s-auto").checked = s.auto_sign;
+  document.getElementById("s-require").checked = s.require_company_name;
+  document.getElementById("s-max").value = s.max_blocks;
+  document.getElementById("s-flatten").checked = s.flatten_after_signing;
+  document.getElementById("s-pages").value = s.max_pages;
+  document.getElementById("s-ctx").value = s.num_ctx;
+  document.getElementById("s-mb").value = s.max_mb;
+  document.getElementById("s-types").innerHTML = data.doc_types.map(t =>
+    `<label><input type="checkbox" value="${esc(t)}" ${s.auto_sign_types.includes(t) ? "checked" : ""}> ${esc(t.replace(/_/g, " "))}</label>`).join("");
+  const health = await api("/api/health");
+  const models = new Set([...(health.ollama.models || []), s.model]);
+  document.getElementById("s-model").innerHTML = [...models].map(m => `<option ${m === s.model ? "selected" : ""}>${esc(m)}</option>`).join("");
+  document.getElementById("s-signature").value = s.signature_file;
+  const sig = data.signature;
+  document.getElementById("signature-box").hidden = !sig.found;
+  document.getElementById("signature-status").innerHTML = sig.found
+    ? `Using <span class="mono">${esc(sig.path)}</span>.`
+    : `<span class="chip bad">No signature</span> ${esc(sig.error)} Nothing can be signed until there is one.`;
+  if (sig.found) document.getElementById("signature-image").src = `/api/settings/signature?t=${Date.now()}`;
+  document.getElementById("signature-meta").textContent = sig.found
+    ? `${sig.width} × ${sig.height} px after cropping · shape ${sig.aspect} : 1 · file SHA-256 ${sig.sha256.slice(0, 16)}…` : "";
+  document.getElementById("inbox-hint").textContent = `You can also put PDFs in ${data.inbox} and click Process inbox on the Dashboard.`;
+}
+
+async function saveSettings(event) {
+  event.preventDefault();
+  const body = {
+    company_name: document.getElementById("s-company").value,
+    company_aliases: document.getElementById("s-aliases").value,
+    usual_roles: document.getElementById("s-roles").value,
+    signer_name: document.getElementById("s-signer").value,
+    signature_file: document.getElementById("s-signature").value,
+    date_format: document.getElementById("s-date").value,
+    auto_sign: document.getElementById("s-auto").checked,
+    auto_sign_types: [...document.querySelectorAll("#s-types input:checked")].map(i => i.value),
+    require_company_name: document.getElementById("s-require").checked,
+    max_blocks: Number(document.getElementById("s-max").value),
+    model: document.getElementById("s-model").value,
+    num_ctx: Number(document.getElementById("s-ctx").value),
+    flatten_after_signing: document.getElementById("s-flatten").checked,
+    max_pages: Number(document.getElementById("s-pages").value),
+    max_mb: Number(document.getElementById("s-mb").value),
+  };
+  await api("/api/settings", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  toast("Settings saved. New documents use them; use Re-run for documents already in review.");
+  await loadSettings();
+  await loadStatus();
+}
+
+async function uploadSignature(file) {
+  const form = new FormData();
+  form.append("file", file);
+  await api("/api/settings/signature", { method: "POST", body: form });
+  toast("Signature image updated.");
+  await loadSettings();
+}
+
+// ---------------------------------------------------------------- wiring
+for (const button of document.querySelectorAll("nav button")) button.addEventListener("click", () => show(button.dataset.view));
+document.getElementById("inbox-button").addEventListener("click", () => run(processInbox));
+document.getElementById("export-button").addEventListener("click", exportExcel);
+document.getElementById("history-export").addEventListener("click", exportExcel);
+document.getElementById("audit-button").addEventListener("click", () => run(verifyAudit));
+document.getElementById("history-search").addEventListener("input", () => run(loadHistory));
+document.getElementById("history-status").addEventListener("change", () => run(loadHistory));
+document.getElementById("settings-form").addEventListener("submit", event => run(() => saveSettings(event)));
+document.getElementById("signature-input").addEventListener("change", event => { if (event.target.files[0]) run(() => uploadSignature(event.target.files[0])); event.target.value = ""; });
+document.getElementById("file-input").addEventListener("change", event => { run(() => uploadFiles(event.target.files)); event.target.value = ""; });
+const drop = document.getElementById("drop");
+drop.addEventListener("dragover", event => { event.preventDefault(); drop.classList.add("over"); });
+drop.addEventListener("dragleave", () => drop.classList.remove("over"));
+drop.addEventListener("drop", event => { event.preventDefault(); drop.classList.remove("over"); run(() => uploadFiles(event.dataTransfer.files)); });
+
+// Keep the open view current while documents are processed.
+setInterval(() => {
+  if (state.view === "dashboard") run(loadDashboard);
+  else if (state.view === "upload") run(pollUploads);
+  else if (!state.placing) run(loadStatus);         // keep the header chips and review count current
+}, 4000);
+
+// Open a view straight from the address: #review, #history/2026-11-10-0001, #settings ...
+function openFromAddress() {
+  const [view, job] = location.hash.slice(1).split("/");
+  if (job && view === "review") state.reviewId = decodeURIComponent(job);
+  if (job && view === "history") state.historyId = decodeURIComponent(job);
+  show(["dashboard", "upload", "review", "history", "settings"].includes(view) ? view : "dashboard");
+}
+
+run(async () => { await loadSettings(); openFromAddress(); await loadStatus(); });
+</script>
+</body>
+</html>
