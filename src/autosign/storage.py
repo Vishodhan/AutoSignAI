@@ -1,165 +1,70 @@
 """
-Where the app keeps things: its folders, its settings (settings.json), the ledger (one SQLite
-row per document), the hash-chained audit log, and the Excel export.
+Where AutoSign keeps things.
+
+    storage/autosign.db      SQLite: the agreements and the client files (their state, not their history)
+    storage/audit-log.csv    the audit log: one row per event, hash-chained, append-only
+    storage/agreements/      every uploaded agreement (<id>.pdf), and the copy your company has
+                             already signed (<id>.presigned.pdf), which is what each client signs
+    storage/signed/          every copy signed by a client
+    data/signature.png       your company's signature image, kept with the code
+
+AutoSign runs from the project folder (locally the repository, on Railway /app), and finds .env,
+data/ and storage/ there. AUTOSIGN_HOME moves storage/ elsewhere (on Railway: the volume, /data);
+COMPANY_SIGNATURE_FILE points at another signature image.
+
+An agreement row holds, as JSON: the analysis (pipeline.analyze), the AI's opinion, the client's
+places ('proposal') and their stamp positions ('placements'), and 'company': the company's
+places, stamp positions and signing record (signer, signed_at, date, sha256, note).
 """
 
+import csv
 import hashlib
+import io
 import json
 import os
-import re
+import secrets
 import sqlite3
 import threading
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
-from openpyxl import Workbook
-from openpyxl.styles import Font
-
-from autosign import pipeline, policy
-
-# =============================================================================
-# Folders and settings
-# =============================================================================
-
-# Where the code is (src/autosign) and where the app keeps its data: the project folder, two levels up.
-# Tests point AUTOSIGN_HOME at a temporary folder instead.
-PACKAGE_DIR = Path(__file__).resolve().parent
-PROJECT_DIR = PACKAGE_DIR.parents[1]
-HOME = Path(os.environ.get("AUTOSIGN_HOME", PROJECT_DIR))
+HOME = Path(os.environ.get("AUTOSIGN_HOME") or ".").resolve()
 STORAGE = HOME / "storage"
-ORIGINALS = STORAGE / "originals"        # every received PDF, named by job ID (never modified)
-SIGNED = STORAGE / "signed"              # signed copies, named by job ID (used for downloads and previews)
-REPORTS = STORAGE / "reports"            # Excel exports
-SIGNATURE_BACKUPS = STORAGE / "signature-backups"   # earlier signature images, kept when you upload a new one
-DB_FILE = STORAGE / "ledger.db"
-INBOX = HOME / "inbox"                   # drop PDFs here, then click "Process inbox"
-PROCESSED = INBOX / "processed"          # inbox files move here once they are queued
-OUTPUT = HOME / "output"                 # every signed PDF is also saved here under its original name
-SETTINGS_FILE = HOME / "settings.json"
-INDEX_HTML = PACKAGE_DIR / "static" / "index.html"
-DEFAULT_ASPECT = 3.5                     # signature width / height, used for placement only when no image exists
+AGREEMENTS = STORAGE / "agreements"
+SIGNED = STORAGE / "signed"
+DB_FILE = STORAGE / "autosign.db"
+AUDIT_FILE = STORAGE / "audit-log.csv"
+STATIC = Path(__file__).resolve().parent / "static"
+COMPANY_SIGNATURE = Path(os.environ.get("COMPANY_SIGNATURE_FILE") or "data/signature.png").resolve()
 
-DEFAULT_SETTINGS = {
-    "company_name": "Acme Analytics Inc.",       # an example: change it to your company in Settings
-    "company_aliases": ["Acme Analytics"],
-    "usual_roles": ["Service Provider", "Provider", "Consultant", "Receiving Party", "Disclosing Party"],
-    "signer_name": "",                           # the person whose signature this is (optional)
-    "signature_file": "data/signature.png",      # your signature image, read fresh on every signing
-    "date_format": "%b %d, %Y",
-    "auto_sign": False,                  # off = shadow mode: everything waits for a person
-    "auto_sign_types": ["nda", "mutual_nda", "service_agreement", "msa", "sow"],
-    "require_company_name": False,       # on = auto-sign only when your company's name is in the document
-    "max_blocks": 5,                     # more of your blocks than this in one document goes to review
-    "model": "qwen3.5-4b-32k:latest",            # qwen3.5:4b with a 32k context (see README)
-    "ollama_host": "http://127.0.0.1:11434",
-    "ai_timeout": 180,
-    "num_ctx": 32768,                            # context size sent with every AI request
-    "max_pages": 300,
-    "max_mb": 100,
-    "flatten_after_signing": False,
-}
+LOCK = threading.RLock()        # one writer at a time for the audit chain and the database
 
 
-def load_settings():
-    """The defaults, overridden by settings.json. Keys the app no longer uses are dropped."""
-    settings = dict(DEFAULT_SETTINGS)
-    if SETTINGS_FILE.exists():
-        saved = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
-        settings.update({k: v for k, v in saved.items() if k in DEFAULT_SETTINGS})
-    return settings
+def now_text():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
 
-def save_settings(settings):
-    SETTINGS_FILE.write_text(json.dumps(settings, indent=2), encoding="utf-8")
+def new_token():
+    """A link secret: 144 random bits, so links can't be guessed."""
+    return secrets.token_urlsafe(18)
 
 
-def as_list(value):
-    """Accept a list or a comma-separated string; return a clean list of strings."""
-    if isinstance(value, str):
-        value = value.split(",")
-    return [str(v).strip() for v in (value or []) if str(v).strip()]
-
-
-def as_int(value, name, low, high):
-    try:
-        number = int(value)
-    except (TypeError, ValueError):
-        raise ValueError(f"{name} must be a whole number")
-    if not low <= number <= high:
-        raise ValueError(f"{name} must be between {low} and {high}")
-    return number
-
-
-def validate_settings(new):
-    """Check settings sent by the GUI or API. Raises ValueError with a message a person can act on."""
-    s = load_settings()
-    s.update({k: v for k, v in new.items() if k in DEFAULT_SETTINGS})
-    for key in ("company_name", "model", "ollama_host", "date_format", "signature_file"):
-        s[key] = str(s[key]).strip()
-        if not s[key]:
-            raise ValueError(f"{key.replace('_', ' ').capitalize()} can't be empty")
-    s["signer_name"] = str(s["signer_name"] or "").strip()
-    if Path(s["signature_file"]).suffix.lower() not in (".png", ".jpg", ".jpeg"):
-        raise ValueError("The signature file must be a .png or .jpg image, for example data/signature.png")
-    for key in ("company_aliases", "usual_roles", "auto_sign_types"):
-        s[key] = as_list(s[key])
-    unknown = [t for t in s["auto_sign_types"] if t not in policy.DOC_TYPES]
-    if unknown:
-        raise ValueError(f"Unknown document type(s): {', '.join(unknown)}. Use: {', '.join(policy.DOC_TYPES)}")
-    for key in ("auto_sign", "flatten_after_signing", "require_company_name"):
-        s[key] = s[key] in (True, "true", "True", 1, "1", "on")
-    s["max_blocks"] = as_int(s["max_blocks"], "Most blocks per document", 1, 20)
-    s["ai_timeout"] = as_int(s["ai_timeout"], "AI timeout", 10, 1200)
-    s["num_ctx"] = as_int(s["num_ctx"], "Context size", 2048, 131072)
-    s["max_pages"] = as_int(s["max_pages"], "Max pages", 1, 5000)
-    s["max_mb"] = as_int(s["max_mb"], "Max MB", 1, 2000)
-    try:
-        sample = datetime(2026, 11, 9).strftime(s["date_format"])
-    except ValueError:
-        raise ValueError("The date format isn't valid. Example: %b %d, %Y gives Nov 09, 2026")
-    if not re.search(r"\d", sample):
-        raise ValueError("The date format must produce a date, for example %b %d, %Y or %m/%d/%Y")
-    return s
-
-
-def signature_path(settings):
-    path = Path(settings["signature_file"])
-    return path if path.is_absolute() else HOME / path
-
-
-def signature_info(settings):
-    """Your signature image, read fresh from its file and cleaned in memory (the file isn't changed).
-
-    Without a usable image nothing can be signed: there is no stand-in signature on purpose.
-    The fingerprint of the file is logged with every signing, so a swapped image shows up.
-    """
-    path, shown = signature_path(settings), settings["signature_file"]
-    if not path.exists():
-        return {"found": False, "path": shown, "aspect": DEFAULT_ASPECT,
-                "error": f"No signature image at {shown}. Put your signature there, or upload one in Settings."}
-    raw = path.read_bytes()
-    try:
-        png = pipeline.prepare_signature(raw)
-    except Exception as error:
-        return {"found": False, "path": shown, "aspect": DEFAULT_ASPECT,
-                "error": f"The signature image at {shown} can't be used: {error}"}
-    aspect, width, height = pipeline.image_aspect(png)
-    return {"found": True, "path": shown, "png": png, "aspect": aspect, "width": width, "height": height,
-            "sha256": pipeline.bytes_fingerprint(raw), "error": ""}
+def fingerprint(data):
+    return hashlib.sha256(data).hexdigest()
 
 
 # =============================================================================
-# The ledger (SQLite), the audit log and the Excel export
+# The database: agreements and client files
 # =============================================================================
 
-DB_LOCK = threading.RLock()      # one writer at a time for job IDs and the audit chain
-
-
-JOB_COLUMNS = ["job_id", "filename", "source", "uploader", "fingerprint", "received_at", "finished_at",
-               "status", "reasons", "pages", "lock_level", "doc_type", "parties", "our_role", "signed_where",
-               "date_filled", "rules_pick", "ai_pick", "agreed", "model", "model_digest", "prompt_version",
-               "reviewer", "decision", "output_path", "output_fingerprint", "signature_sha256", "seconds",
-               "error", "record"]
+AGREEMENT_COLUMNS = ["token", "filename", "firm_name", "created_at", "sha256", "analysis", "ai", "proposal",
+                     "placements", "reasons", "summary", "status", "company"]
+FILE_COLUMNS = ["agreement_id", "manage_token", "sign_token", "client_name", "reference", "status", "created_at",
+                "viewed_at", "signed_at", "signer_name", "signer_ip", "signer_agent", "signed_sha256",
+                "certificate", "placements"]
+JSON_COLUMNS = {"analysis", "ai", "proposal", "placements", "reasons", "company"}
+UNIQUE_COLUMNS = {"token", "manage_token", "sign_token"}
+FILE_LOOKUPS = {"id", "manage_token", "sign_token", "signed_sha256"}
 
 
 def connect():
@@ -168,145 +73,270 @@ def connect():
     return con
 
 
-def db_query(sql, params=()):
+def decode(row):
+    """A database row as a dict, with its JSON columns read back."""
+    row = dict(row)
+    for key in JSON_COLUMNS & row.keys():
+        if row[key]:
+            row[key] = json.loads(row[key])
+        else:
+            row[key] = None
+    return row
+
+
+def encode(value):
+    if isinstance(value, (list, dict)):
+        return json.dumps(value, ensure_ascii=False)
+    return value
+
+
+def query(sql, params=()):
     con = connect()
     try:
-        return [dict(row) for row in con.execute(sql, params).fetchall()]
+        rows = con.execute(sql, params).fetchall()
     finally:
         con.close()
+    return [decode(row) for row in rows]
 
 
-def db_execute(sql, params=()):
+def first(sql, params):
+    rows = query(sql, params)
+    if rows:
+        return rows[0]
+    return None
+
+
+def execute(sql, params=()):
     con = connect()
     try:
-        con.execute(sql, params)
+        cursor = con.execute(sql, params)
         con.commit()
+        return cursor.lastrowid
     finally:
         con.close()
 
 
-def init_db():
+def column_definition(column):
+    if column in UNIQUE_COLUMNS:
+        return f"{column} TEXT UNIQUE"
+    return f"{column} TEXT"
+
+
+def create_table(con, table, columns):
+    """Create the table, or add the columns a database from an older version doesn't have yet."""
+    definitions = ", ".join(column_definition(column) for column in columns)
+    con.execute(f"CREATE TABLE IF NOT EXISTS {table} (id INTEGER PRIMARY KEY, {definitions})")
+    existing = {row[1] for row in con.execute(f"PRAGMA table_info({table})")}
+    for column in columns:
+        if column not in existing:
+            con.execute(f"ALTER TABLE {table} ADD COLUMN {column} TEXT")
+
+
+def init():
+    """Create the folders and tables, and remove half-finished copies a crash may have left."""
+    for folder in (AGREEMENTS, SIGNED):
+        folder.mkdir(parents=True, exist_ok=True)
     con = connect()
     try:
         con.execute("PRAGMA journal_mode=WAL")
-        con.execute("CREATE TABLE IF NOT EXISTS jobs (seq INTEGER PRIMARY KEY, "
-                    + ", ".join(f"{c} TEXT" if c != "job_id" else "job_id TEXT UNIQUE" for c in JOB_COLUMNS) + ")")
-        con.execute("CREATE TABLE IF NOT EXISTS audit (seq INTEGER PRIMARY KEY, at TEXT, job_id TEXT, event TEXT, "
-                    "detail TEXT, prev_hash TEXT, hash TEXT)")
+        create_table(con, "agreements", AGREEMENT_COLUMNS)
+        create_table(con, "files", FILE_COLUMNS)
         con.commit()
     finally:
         con.close()
+    for folder in (AGREEMENTS, SIGNED):
+        for leftover in folder.glob("*.work*.pdf"):
+            leftover.unlink(missing_ok=True)
 
 
-def get_job(job_id):
-    rows = db_query("SELECT * FROM jobs WHERE job_id = ?", (job_id,))
-    return rows[0] if rows else None
+def check_columns(table, columns, fields):
+    unknown = sorted(set(fields) - set(columns))
+    if unknown:
+        raise KeyError(f"Unknown {table} column(s): {', '.join(unknown)}")
 
 
-def update_job(job_id, **fields):
-    for key in fields:
-        if key not in JOB_COLUMNS:
-            raise KeyError(f"Unknown ledger column: {key}")
-    values = [json.dumps(v, ensure_ascii=False) if isinstance(v, (list, dict)) else v for v in fields.values()]
-    with DB_LOCK:
-        db_execute("UPDATE jobs SET " + ", ".join(f"{k} = ?" for k in fields) + " WHERE job_id = ?", (*values, job_id))
+def insert(table, columns, fields):
+    check_columns(table, columns, fields)
+    names = list(fields)
+    values = [encode(fields[name]) for name in names]
+    marks = ", ".join("?" for _ in names)
+    with LOCK:
+        return execute(f"INSERT INTO {table} ({', '.join(names)}) VALUES ({marks})", values)
 
 
-def now_text():
-    return datetime.now().isoformat(sep=" ", timespec="seconds")
+def update(table, columns, row_id, fields):
+    check_columns(table, columns, fields)
+    names = list(fields)
+    values = [encode(fields[name]) for name in names]
+    assignments = ", ".join(f"{name} = ?" for name in names)
+    with LOCK:
+        execute(f"UPDATE {table} SET {assignments} WHERE id = ?", values + [row_id])
 
 
-def audit(job_id, event, detail):
-    """Append one line to the audit log. Each line carries the hash of the line before it."""
-    with DB_LOCK:
-        last = db_query("SELECT hash FROM audit ORDER BY seq DESC LIMIT 1")
-        prev = last[0]["hash"] if last else "0" * 64
-        at = now_text()
-        detail_json = json.dumps(detail, sort_keys=True, ensure_ascii=False)
-        digest = hashlib.sha256(f"{prev}|{at}|{job_id}|{event}|{detail_json}".encode("utf-8")).hexdigest()
-        db_execute("INSERT INTO audit (at, job_id, event, detail, prev_hash, hash) VALUES (?, ?, ?, ?, ?, ?)",
-                   (at, job_id, event, detail_json, prev, digest))
+def create_agreement(**fields):
+    fields = dict(fields, token=new_token(), created_at=now_text())
+    return insert("agreements", AGREEMENT_COLUMNS, fields)
+
+
+def update_agreement(agreement_id, **fields):
+    update("agreements", AGREEMENT_COLUMNS, agreement_id, fields)
+
+
+def agreement_by_token(token):
+    return first("SELECT * FROM agreements WHERE token = ?", (token,))
+
+
+def agreement_by_id(agreement_id):
+    return first("SELECT * FROM agreements WHERE id = ?", (agreement_id,))
+
+
+def agreement_pdf(agreement):
+    """The agreement exactly as the company uploaded it."""
+    return AGREEMENTS / f"{agreement['id']}.pdf"
+
+
+def presigned_pdf(agreement):
+    """The agreement with the company's signature already on it."""
+    return AGREEMENTS / f"{agreement['id']}.presigned.pdf"
+
+
+def pdf_for_client(agreement):
+    """What each client signs: the copy the company signed, or the original when the company doesn't sign."""
+    company = agreement["company"] or {}
+    presigned = presigned_pdf(agreement)
+    if company.get("signed_at") and presigned.exists():
+        return presigned
+    return agreement_pdf(agreement)
+
+
+def create_file(agreement_id, client_name, reference):
+    fields = {"agreement_id": agreement_id, "client_name": client_name, "reference": reference, "status": "sent",
+              "created_at": now_text(), "manage_token": new_token(), "sign_token": new_token()}
+    return insert("files", FILE_COLUMNS, fields)
+
+
+def update_file(file_id, **fields):
+    update("files", FILE_COLUMNS, file_id, fields)
+
+
+def file_by(column, value):
+    if column not in FILE_LOOKUPS:
+        raise KeyError(column)
+    return first(f"SELECT * FROM files WHERE {column} = ?", (value,))
+
+
+def files_for(agreement_id):
+    return query("SELECT * FROM files WHERE agreement_id = ? ORDER BY id DESC", (agreement_id,))
+
+
+def signed_pdf(file):
+    return SIGNED / f"{file['id']}.pdf"
+
+
+# =============================================================================
+# The audit log: a CSV file, one row per event, each row carrying the hash of the row before it
+# =============================================================================
+
+AUDIT_COLUMNS = ["seq", "time_utc", "event", "agreement_id", "file_id", "document", "client", "reference",
+                 "actor", "ip", "detail", "sha256", "prev_hash", "hash"]
+GENESIS = "0" * 64
+_last = {"seq": None, "hash": None}         # the last row written, kept so each append doesn't re-read the log
+
+
+def safe_cell(value):
+    """Text as stored in the log. A cell starting with = + - @ gets a quote, so Excel never runs it as a formula."""
+    if value is None:
+        value = ""
+    text = " ".join(str(value).split())
+    if text[:1] in ("=", "+", "-", "@"):
+        return "'" + text
+    return text
+
+
+def row_hash(prev, row):
+    parts = [prev]
+    for column in AUDIT_COLUMNS:
+        if column not in ("prev_hash", "hash"):
+            parts.append(row[column])
+    return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()
+
+
+def read_audit():
+    if not AUDIT_FILE.exists():
+        return []
+    with AUDIT_FILE.open(newline="", encoding="utf-8") as f:
+        return list(csv.DictReader(f))
+
+
+def load_last_row():
+    rows = read_audit()
+    if rows:
+        _last["seq"] = int(rows[-1]["seq"])
+        _last["hash"] = rows[-1]["hash"]
+    else:
+        _last["seq"] = 0
+        _last["hash"] = GENESIS
+
+
+def audit(event, agreement=None, file=None, actor="", ip="", detail="", sha256=""):
+    """Append one event to the audit log."""
+    values = {"event": event, "actor": actor, "ip": ip, "detail": detail, "sha256": sha256,
+              "agreement_id": "", "document": "", "file_id": "", "client": "", "reference": ""}
+    if agreement:
+        values["agreement_id"] = agreement["id"]
+        values["document"] = agreement["filename"]
+    if file:
+        values["file_id"] = file["id"]
+        values["client"] = file["client_name"]
+        values["reference"] = file["reference"]
+    with LOCK:
+        if _last["seq"] is None:
+            load_last_row()
+        values["seq"] = _last["seq"] + 1
+        values["time_utc"] = now_text()
+        row = {}
+        for column in AUDIT_COLUMNS[:-2]:
+            row[column] = safe_cell(values[column])
+        row["prev_hash"] = _last["hash"]
+        row["hash"] = row_hash(row["prev_hash"], row)
+        new_log = not AUDIT_FILE.exists()
+        with AUDIT_FILE.open("a", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=AUDIT_COLUMNS)
+            if new_log:
+                writer.writeheader()
+            writer.writerow(row)
+            f.flush()
+            os.fsync(f.fileno())
+        _last["seq"] = int(row["seq"])
+        _last["hash"] = row["hash"]
+        return row
 
 
 def verify_audit():
-    """Recompute the hash chain. An edited or deleted line breaks it."""
-    prev, count = "0" * 64, 0
-    for row in db_query("SELECT * FROM audit ORDER BY seq"):
-        expected = hashlib.sha256(f"{prev}|{row['at']}|{row['job_id']}|{row['event']}|{row['detail']}".encode("utf-8")).hexdigest()
-        if row["prev_hash"] != prev or row["hash"] != expected:
+    """Recompute the hash chain. An edited, inserted or deleted row breaks it."""
+    prev = GENESIS
+    count = 0
+    for row in read_audit():
+        if row["prev_hash"] != prev or row["hash"] != row_hash(prev, row):
             return {"ok": False, "entries": count, "broken_at": row["seq"],
-                    "detail": f"Entry {row['seq']} ({row['event']} for {row['job_id']}) was changed or an entry before it was removed"}
-        prev, count = row["hash"], count + 1
-    return {"ok": True, "entries": count, "detail": f"All {count} entries are intact"}
+                    "detail": f"Row {row['seq']} ({row['event']}) was changed, or a row before it was removed"}
+        prev = row["hash"]
+        count += 1
+    return {"ok": True, "entries": count, "detail": f"All {count} rows are intact"}
 
 
-def public_job(row, with_record=False):
-    """A ledger row as the API returns it: JSON columns decoded, the big record only on request."""
-    job = {k: v for k, v in row.items() if k != "record"}
-    job["reasons"] = json.loads(job["reasons"]) if job.get("reasons") else []
-    for key in ("pages", "seconds"):
-        if job.get(key) not in (None, ""):
-            job[key] = float(job[key]) if key == "seconds" else int(job[key])
-    if with_record:
-        job["record"] = json.loads(row["record"]) if row.get("record") else {}
-    return job
+def audit_rows(agreement_id):
+    """The audit log rows of one agreement and its client files."""
+    rows = []
+    for row in read_audit():
+        if row["agreement_id"] == str(agreement_id):
+            rows.append(row)
+    return rows
 
 
-def daily_export():
-    """Once a day, save the ledger as an Excel workbook in storage/reports."""
-    path = REPORTS / f"ledger-{datetime.now():%Y-%m-%d}.xlsx"
-    if path.exists() or not db_query("SELECT 1 FROM jobs LIMIT 1"):
-        return
-    try:
-        export_excel(path)
-    except OSError:
-        pass          # the file may be open in Excel; the next loop tries again
-
-
-EXPORT_COLUMNS = [
-    ("job_id", "Job ID"), ("filename", "File"), ("source", "Source"), ("uploader", "Uploaded by"),
-    ("received_at", "Received"), ("finished_at", "Finished"), ("status", "Status"), ("decision", "Decision"),
-    ("reasons", "Reasons"), ("pages", "Pages"), ("lock_level", "Lock level"), ("doc_type", "Document type"),
-    ("parties", "Parties"), ("our_role", "Your role"), ("signed_where", "Where it signed"),
-    ("date_filled", "Date filled"), ("rules_pick", "Rules' pick"), ("ai_pick", "AI's pick"), ("agreed", "Agreed"),
-    ("model", "Model"), ("model_digest", "Model digest"), ("prompt_version", "Prompt version"),
-    ("reviewer", "Reviewer"), ("fingerprint", "Original SHA-256"), ("output_fingerprint", "Signed SHA-256"),
-    ("output_path", "Signed file"), ("signature_sha256", "Signature image SHA-256"), ("seconds", "Seconds"),
-    ("error", "Error"),
-]
-
-
-def excel_value(key, value):
-    if value is None:
-        return ""
-    if key == "reasons":
-        value = "; ".join(json.loads(value)) if value else ""
-    return re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", "", str(value))
-
-
-def add_sheet(workbook, title, rows, first=False):
-    sheet = workbook.active if first else workbook.create_sheet()
-    sheet.title = title
-    sheet.append([label for _, label in EXPORT_COLUMNS])
-    for cell in sheet[1]:
-        cell.font = Font(bold=True)
-    for row in rows:
-        sheet.append([excel_value(key, row.get(key)) for key, _ in EXPORT_COLUMNS])
-        for cell in sheet[sheet.max_row]:
-            if isinstance(cell.value, str) and cell.value.startswith("="):
-                cell.data_type = "s"        # a file named '=1+2.pdf' stays text, never a formula
-    sheet.freeze_panes = "B2"
-    for index, (key, label) in enumerate(EXPORT_COLUMNS, start=1):
-        width = max([len(label)] + [len(excel_value(key, r.get(key))) for r in rows[:200]])
-        sheet.column_dimensions[sheet.cell(row=1, column=index).column_letter].width = min(60, width + 2)
-
-
-def export_excel(path):
-    rows = db_query("SELECT * FROM jobs ORDER BY seq")
-    workbook = Workbook()
-    add_sheet(workbook, "Ledger", rows, first=True)
-    add_sheet(workbook, "Auto-signed", [r for r in rows if r.get("decision") == "auto"])
-    temp = Path(path).with_suffix(".tmp.xlsx")
-    workbook.save(temp)
-    os.replace(temp, path)
-    return path
+def audit_csv(rows):
+    out = io.StringIO()
+    writer = csv.DictWriter(out, fieldnames=AUDIT_COLUMNS, lineterminator="\n")
+    writer.writeheader()
+    writer.writerows(rows)
+    return out.getvalue()

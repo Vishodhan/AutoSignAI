@@ -1,0 +1,593 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<meta name="robots" content="noindex, nofollow">
+<title>Your agreement: AutoSign</title>
+<link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+<header>
+  <div class="bar">
+    <a class="brand" href="/">AutoSign <small>client agreements, signed on every file</small></a>
+    <nav><a href="/">Upload another agreement</a><a href="/verify">Check a signed copy</a></nav>
+  </div>
+</header>
+
+<main>
+  <section class="card">
+    <div class="row">
+      <h1 id="title">Loading the agreement…</h1>
+      <span id="status-chip"></span>
+    </div>
+    <p class="muted small" id="subtitle"></p>
+    <div id="status-banner"></div>
+    <div id="company-banner" class="spaced"></div>
+    <ul class="muted small notes" id="notes"></ul>
+    <p class="muted small spaced">Bookmark this page: it is the only way back to this agreement and its client files.
+      Anyone with this link can see them.</p>
+  </section>
+
+  <section class="card">
+    <h2>Client files</h2>
+    <p class="muted small">A client file is one case for one client. Each one gets its own signing link, and its own signed copy.</p>
+    <div class="stats" id="stats"></div>
+    <form class="new-file" id="new-file">
+      <label class="field">Client's name
+        <input type="text" id="client-name" required minlength="2" maxlength="120" placeholder="e.g. Foo Holdings LLC">
+      </label>
+      <label class="field">Your file reference (optional)
+        <input type="text" id="reference" maxlength="80" placeholder="e.g. 2026-014">
+      </label>
+      <button class="btn primary" type="submit" id="create-file">Create signing link</button>
+    </form>
+    <p class="banner warn small" id="not-ready" hidden>Confirm the signature places below before creating signing links.</p>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>Client</th><th>Reference</th><th>Link created</th><th>Opened</th><th>Signed</th><th>Status</th><th></th></tr>
+        </thead>
+        <tbody id="files"></tbody>
+      </table>
+    </div>
+    <p class="empty" id="no-files">No client files yet. Create the first one above.</p>
+    <div class="row spaced">
+      <a class="btn small" id="audit-link" href="#">Download the audit log (CSV)</a>
+      <button class="btn small" type="button" id="refresh">Refresh</button>
+      <span class="muted small">This list refreshes by itself every 20 seconds.</span>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>Where everyone signs</h2>
+    <div class="legend">
+      <span><span class="swatch client"></span>The client signs here</span>
+      <span><span class="swatch company"></span>Your company signs here</span>
+      <span><span class="swatch other"></span>Left empty</span>
+    </div>
+    <div class="grid-2">
+      <div>
+        <p class="muted small">Choose who signs at each place AutoSign found. If it missed one, add it by hand and
+          click the page where it goes.</p>
+        <div class="spot-list" id="spots"></div>
+        <div class="spot-list spaced" id="manual"></div>
+        <div class="row spaced" id="add-buttons">
+          <button class="btn" type="button" data-add="client">Add a client place by hand</button>
+          <button class="btn" type="button" data-add="company">Add a company place by hand</button>
+        </div>
+        <div class="row spaced" id="placing-buttons" hidden>
+          <button class="btn" type="button" id="no-date" hidden>No date for this place</button>
+          <button class="btn" type="button" id="cancel-placing">Cancel</button>
+        </div>
+        <p class="small spaced" id="placing-help" hidden></p>
+        <div class="row spaced">
+          <button class="btn primary" type="button" id="confirm">Confirm these places</button>
+        </div>
+        <p class="muted small spaced" id="confirm-help"></p>
+      </div>
+      <div>
+        <div class="page-tabs" id="page-tabs"></div>
+        <div class="viewer">
+          <div class="page-box" id="page-box">
+            <img id="page-image" alt="The agreement page with its signature places">
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+</main>
+
+<footer>AutoSign. Test data only: don't upload real people's personal information.</footer>
+
+<script src="/static/common.js"></script>
+<script>
+"use strict";
+
+const token = tokenFromPath();
+const apiBase = `/api/agreements/${encodeURIComponent(token)}`;
+const REFRESH_SECONDS = 20;
+const SIDE_TEXT = { client: "The client signs here", company: "Your company signs here" };
+
+let view = null;            // the agreement, as /api/agreements/<token> returns it
+let currentPage = 1;
+let imageVersion = Date.now();
+let sideOf = new Map();     // spot id -> "client" or "company" (a spot not in the map is left empty)
+let manualPlaces = [];      // places added by hand: {side, page, x, y, date: [x, y] or null}
+let placing = null;         // while adding a place by hand: {side, sig: {x, y} once the first click is in}
+
+// ---------------------------------------------------------------------------
+// Small helpers
+// ---------------------------------------------------------------------------
+
+// "2026-11-12 03:53:14 UTC" from the server, shown in the reader's own time.
+function localTime(text) {
+  if (!text) {
+    return "";
+  }
+  const date = new Date(text.replace(" UTC", "Z").replace(" ", "T"));
+  if (isNaN(date)) {
+    return text;
+  }
+  return date.toLocaleString([], { dateStyle: "medium", timeStyle: "short" });
+}
+
+function spotTitle(spot) {
+  const header = spot.header ? `${spot.header} - ` : "";
+  return `Page ${spot.page}: ${header}${spot.label || "signature"}`;
+}
+
+function pageSize(number) {
+  return view.pages.find((page) => page.number === number);
+}
+
+function hasPlaces(places) {
+  return places.spots.length > 0 || places.manual.length > 0;
+}
+
+// ---------------------------------------------------------------------------
+// The top card: what the agreement is and whether it is ready
+// ---------------------------------------------------------------------------
+
+function renderStatus() {
+  document.title = `${view.filename}: AutoSign`;
+  document.getElementById("title").textContent = view.filename;
+  document.getElementById("subtitle").textContent =
+    `Sent by ${view.firm_name} · ${view.page_count} page(s) · uploaded ${localTime(view.created_at)}`;
+
+  const ready = view.status === "ready";
+  document.getElementById("status-chip").innerHTML = ready
+    ? '<span class="chip good">Ready to send</span>'
+    : '<span class="chip warn">Check the signature places</span>';
+
+  const banner = document.getElementById("status-banner");
+  if (ready) {
+    banner.innerHTML = `<div class="banner good">${esc(view.summary)}</div>`;
+  } else {
+    const reasons = view.reasons.map((reason) => `<li>${esc(reason)}</li>`).join("");
+    banner.innerHTML = `<div class="banner warn"><b>AutoSign isn't sure where everyone signs.</b>
+      Check the places below, then press <b>Confirm these places</b>.<ul>${reasons}</ul></div>`;
+  }
+
+  const company = view.company;
+  const companyBanner = document.getElementById("company-banner");
+  if (company.signed_at) {
+    const signer = company.signer || view.firm_name;
+    companyBanner.innerHTML = `<div class="banner good">Signed for ${esc(view.firm_name)} by ${esc(signer)}
+      (date written: ${esc(company.date)}). Every client signs this pre-signed copy.</div>`;
+  } else if (company.note) {
+    companyBanner.innerHTML = `<div class="banner warn">${esc(company.note)}</div>`;
+  } else if (hasPlaces(company)) {
+    companyBanner.innerHTML = `<div class="banner warn">AutoSign will sign for ${esc(view.firm_name)}
+      once you confirm the places.</div>`;
+  } else {
+    companyBanner.innerHTML = "";
+  }
+
+  document.getElementById("notes").innerHTML = view.notes.map((note) => `<li>${esc(note)}</li>`).join("");
+}
+
+// ---------------------------------------------------------------------------
+// The client files dashboard
+// ---------------------------------------------------------------------------
+
+function renderStats() {
+  let signed = 0;
+  let opened = 0;
+  for (const file of view.files) {
+    if (file.status === "signed") {
+      signed += 1;
+    } else if (file.status === "viewed") {
+      opened += 1;
+    }
+  }
+  const total = view.files.length;
+  const boxes = [
+    [total, "client files"],
+    [signed, "signed"],
+    [opened, "opened, not signed"],
+    [total - signed - opened, "not opened yet"],
+  ];
+  document.getElementById("stats").innerHTML = boxes
+    .map(([count, label]) => `<div class="stat"><b>${count}</b><span>${label}</span></div>`)
+    .join("");
+}
+
+function fileRow(file) {
+  let signedText = "";
+  if (file.signed_at) {
+    signedText = `${esc(localTime(file.signed_at))}<br><span class="muted small">by ${esc(file.signer_name)}</span>`;
+  }
+  let actions = `<button class="btn small" type="button" data-copy="${esc(file.sign_url)}">Copy link</button>`;
+  if (file.signed_pdf_url) {
+    actions += `<a class="btn small" href="${esc(file.signed_pdf_url)}" target="_blank" rel="noopener">View PDF</a>`;
+    actions += `<a class="btn small" href="${esc(file.signed_pdf_url)}?download=1">Download</a>`;
+  }
+  return `<tr>
+    <td>${esc(file.client_name)}</td>
+    <td>${esc(file.reference)}</td>
+    <td>${esc(localTime(file.created_at))}</td>
+    <td>${esc(localTime(file.viewed_at))}</td>
+    <td>${signedText}</td>
+    <td>${statusChip(file.status)}</td>
+    <td class="actions">${actions}</td>
+  </tr>`;
+}
+
+function renderFiles() {
+  renderStats();
+  const ready = view.status === "ready";
+  document.getElementById("create-file").disabled = !ready;
+  document.getElementById("not-ready").hidden = ready;
+  document.getElementById("files").innerHTML = view.files.map(fileRow).join("");
+  document.getElementById("no-files").hidden = view.files.length > 0;
+  document.getElementById("audit-link").href = `${apiBase}/audit.csv`;
+}
+
+document.getElementById("files").addEventListener("click", (event) => {
+  const button = event.target.closest("[data-copy]");
+  if (button) {
+    copyText(fullUrl(button.dataset.copy), button);
+  }
+});
+
+document.getElementById("new-file").addEventListener("submit", (event) => {
+  event.preventDefault();
+  run(async () => {
+    const nameInput = document.getElementById("client-name");
+    const referenceInput = document.getElementById("reference");
+    const file = await sendJSON(`${apiBase}/files`, {
+      client_name: nameInput.value,
+      reference: referenceInput.value,
+    });
+    nameInput.value = "";
+    referenceInput.value = "";
+    await copyText(fullUrl(file.sign_url));
+    await refresh();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Where everyone signs: who signs at each place, and the page picture
+// ---------------------------------------------------------------------------
+
+function resetDraft() {
+  sideOf = new Map();
+  for (const spotId of view.client.spots) {
+    sideOf.set(spotId, "client");
+  }
+  for (const spotId of view.company.spots) {
+    sideOf.set(spotId, "company");
+  }
+  manualPlaces = [];
+  for (const place of view.client.manual) {
+    manualPlaces.push({ ...place, side: "client" });
+  }
+  for (const place of view.company.manual) {
+    manualPlaces.push({ ...place, side: "company" });
+  }
+  placing = null;
+}
+
+function spotRow(spot) {
+  const side = sideOf.get(spot.id) || "";
+  const options = [["", "Left empty"], ["client", SIDE_TEXT.client], ["company", SIDE_TEXT.company]]
+    .map(([value, text]) => `<option value="${value}" ${value === side ? "selected" : ""}>${text}</option>`)
+    .join("");
+  let fitNote = "";
+  if (!spot.fits) {
+    fitNote = '<br><span class="small bad-text">A signature doesn\'t fit here without covering text.</span>';
+  }
+  return `<div class="spot-row ${side}">
+    <span>${esc(spotTitle(spot))} <span class="muted small">(spot ${spot.id})</span>${fitNote}</span>
+    <select data-spot="${spot.id}" aria-label="Who signs at spot ${spot.id}">${options}</select>
+  </div>`;
+}
+
+function manualRow(place, index) {
+  const date = place.date ? ", with a date" : "";
+  return `<div class="spot-row ${place.side}">
+    <span><span class="tag ${place.side}">${SIDE_TEXT[place.side]}</span><br>Page ${place.page}, placed by hand${date}</span>
+    <button class="btn small" type="button" data-remove="${index}">Remove</button>
+  </div>`;
+}
+
+function renderSpots() {
+  let rows = view.spots.map(spotRow).join("");
+  if (!rows) {
+    rows = '<p class="empty">AutoSign found no signature places. Add them by hand.</p>';
+  }
+  document.getElementById("spots").innerHTML = rows;
+  document.getElementById("manual").innerHTML = manualPlaces.map(manualRow).join("");
+
+  const button = document.getElementById("confirm");
+  const help = document.getElementById("confirm-help");
+  if (view.status === "ready") {
+    button.textContent = "Save changes";
+    help.textContent = "The places are confirmed. If you change them, AutoSign signs for your company again. " +
+      "Copies that clients already signed stay as they are.";
+  } else {
+    button.textContent = "Confirm these places";
+    help.textContent = "AutoSign then signs for your company (where you chose its place), and you can create signing links.";
+  }
+}
+
+document.getElementById("spots").addEventListener("change", (event) => {
+  const select = event.target.closest("[data-spot]");
+  if (!select) {
+    return;
+  }
+  const spotId = Number(select.dataset.spot);
+  if (select.value) {
+    sideOf.set(spotId, select.value);
+  } else {
+    sideOf.delete(spotId);
+  }
+  renderSpots();
+});
+
+document.getElementById("manual").addEventListener("click", (event) => {
+  const button = event.target.closest("[data-remove]");
+  if (button) {
+    manualPlaces.splice(Number(button.dataset.remove), 1);
+    renderSpots();
+    drawMarks();
+  }
+});
+
+function renderPageTabs() {
+  const tabs = [];
+  for (let number = 1; number <= view.page_count; number += 1) {
+    const hasSpot = view.spots.some((spot) => spot.page === number);
+    const label = hasSpot ? `Page ${number} ✎` : `Page ${number}`;
+    const current = number === currentPage ? "true" : "false";
+    tabs.push(`<button class="btn small" type="button" data-page="${number}" aria-current="${current}">${label}</button>`);
+  }
+  document.getElementById("page-tabs").innerHTML = tabs.join("");
+}
+
+document.getElementById("page-tabs").addEventListener("click", (event) => {
+  const button = event.target.closest("[data-page]");
+  if (button) {
+    showPage(Number(button.dataset.page));
+  }
+});
+
+function showPage(number) {
+  currentPage = number;
+  renderPageTabs();
+  document.getElementById("page-image").src = `${apiBase}/pages/${number}.png?v=${imageVersion}`;
+}
+
+// The first page where the client signs, else the first page with any place, else page 1.
+function firstSigningPage() {
+  const pages = view.client.manual.map((place) => place.page);
+  for (const spot of view.spots) {
+    if (view.client.spots.includes(spot.id)) {
+      pages.push(spot.page);
+    }
+  }
+  if (pages.length) {
+    return Math.min(...pages);
+  }
+  if (view.spots.length) {
+    return view.spots[0].page;
+  }
+  return 1;
+}
+
+// ---------------------------------------------------------------------------
+// Adding a place by hand: click the signature's centre, then (optionally) the date's start
+// ---------------------------------------------------------------------------
+
+const SIGNATURE_HEIGHT = 32;      // pt, as the server stamps a place added by hand
+const SIGNATURE_ASPECT = 3.5;
+
+function updatePlacing() {
+  const active = placing !== null;
+  document.getElementById("page-box").classList.toggle("placing", active);
+  document.getElementById("add-buttons").hidden = active;
+  document.getElementById("placing-buttons").hidden = !active;
+  document.getElementById("no-date").hidden = !(active && placing.sig);
+  const help = document.getElementById("placing-help");
+  help.hidden = !active;
+  if (!active) {
+    return;
+  }
+  const whose = placing.side === "client" ? "the client's" : "your company's";
+  if (!placing.sig) {
+    help.textContent = `Click the page where ${whose} signature should go (its centre).`;
+  } else {
+    help.textContent = "Now click where the date should start, or press 'No date for this place'.";
+  }
+}
+
+function pointFromClick(event) {
+  const image = document.getElementById("page-image");
+  const box = image.getBoundingClientRect();
+  const scale = image.clientWidth / pageSize(currentPage).width;
+  return {
+    x: Math.round(((event.clientX - box.left) / scale) * 10) / 10,
+    y: Math.round(((event.clientY - box.top) / scale) * 10) / 10,
+  };
+}
+
+function finishPlacing(datePoint) {
+  manualPlaces.push({
+    side: placing.side,
+    page: currentPage,
+    x: placing.sig.x,
+    y: placing.sig.y,
+    date: datePoint ? [datePoint.x, datePoint.y] : null,
+  });
+  placing = null;
+  updatePlacing();
+  renderSpots();
+  drawMarks();
+}
+
+document.getElementById("page-image").addEventListener("click", (event) => {
+  if (placing === null) {
+    return;
+  }
+  const point = pointFromClick(event);
+  if (!placing.sig) {
+    placing.sig = point;
+    updatePlacing();
+    drawMarks();
+  } else {
+    finishPlacing(point);
+  }
+});
+
+document.getElementById("add-buttons").addEventListener("click", (event) => {
+  const button = event.target.closest("[data-add]");
+  if (button) {
+    placing = { side: button.dataset.add, sig: null };
+    updatePlacing();
+  }
+});
+
+document.getElementById("cancel-placing").addEventListener("click", () => {
+  placing = null;
+  updatePlacing();
+  drawMarks();
+});
+
+document.getElementById("no-date").addEventListener("click", () => finishPlacing(null));
+
+// Saving while a place is half added: one whose signature is clicked in is kept, without a date;
+// one with nothing clicked yet is dropped.
+function finishPendingPlace() {
+  if (placing === null) {
+    return;
+  }
+  if (placing.sig) {
+    finishPlacing(null);
+    return;
+  }
+  placing = null;
+  updatePlacing();
+}
+
+// Boxes over the picture for the places added by hand (saved ones are drawn into the picture too).
+function drawMarks() {
+  const box = document.getElementById("page-box");
+  box.querySelectorAll(".mark").forEach((mark) => mark.remove());
+  const image = document.getElementById("page-image");
+  const size = pageSize(currentPage);
+  if (!size || !image.clientWidth) {
+    return;
+  }
+  const marks = manualPlaces.filter((place) => place.page === currentPage);
+  if (placing && placing.sig) {
+    marks.push({ side: placing.side, x: placing.sig.x, y: placing.sig.y });
+  }
+  const scale = image.clientWidth / size.width;
+  const height = SIGNATURE_HEIGHT * scale;
+  const width = SIGNATURE_HEIGHT * SIGNATURE_ASPECT * scale;
+  for (const place of marks) {
+    const mark = document.createElement("div");
+    mark.className = `mark ${place.side}`;
+    mark.style.left = `${place.x * scale - width / 2}px`;
+    mark.style.top = `${place.y * scale - height / 2}px`;
+    mark.style.width = `${width}px`;
+    mark.style.height = `${height}px`;
+    box.appendChild(mark);
+  }
+}
+
+document.getElementById("page-image").addEventListener("load", drawMarks);
+window.addEventListener("resize", drawMarks);
+
+// What the server is sent for one side: the spots it signs, and its places added by hand.
+function placesFor(side) {
+  const choices = [];
+  for (const [spotId, spotSide] of sideOf) {
+    if (spotSide === side) {
+      choices.push({ spot: spotId });
+    }
+  }
+  const manual = manualPlaces
+    .filter((place) => place.side === side)
+    .map((place) => ({ page: place.page, x: place.x, y: place.y, date: place.date }));
+  return { choices: choices, manual: manual };
+}
+
+document.getElementById("confirm").addEventListener("click", () => {
+  run(async () => {
+    finishPendingPlace();
+    const button = document.getElementById("confirm");
+    button.disabled = true;
+    try {
+      const body = {
+        client: placesFor("client"),
+        company: placesFor("company"),
+        tz_offset_minutes: -new Date().getTimezoneOffset(),
+      };
+      view = await sendJSON(`${apiBase}/places`, body, "PUT");
+      imageVersion = Date.now();
+      resetDraft();
+      renderAll();
+      toast("Places confirmed. You can create signing links now.");
+    } finally {
+      button.disabled = false;
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Loading and refreshing
+// ---------------------------------------------------------------------------
+
+function renderAll() {
+  renderStatus();
+  renderFiles();
+  renderSpots();
+  updatePlacing();
+  showPage(currentPage);
+}
+
+async function refresh() {
+  view = await api(apiBase);
+  renderStatus();
+  renderFiles();
+}
+
+document.getElementById("refresh").addEventListener("click", () => run(refresh));
+
+run(async () => {
+  view = await api(apiBase);
+  resetDraft();
+  currentPage = firstSigningPage();
+  renderAll();
+  setInterval(() => {
+    if (!document.hidden) {
+      refresh().catch(() => {});
+    }
+  }, REFRESH_SECONDS * 1000);
+});
+</script>
+</body>
+</html>

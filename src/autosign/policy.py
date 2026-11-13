@@ -1,29 +1,38 @@
 """
-The signing policy: every word list, distance and limit the rules use, in one place.
+Every word list, distance and limit the rules use, in one place.
 
 Change a value here to tune the rules; the tests in tests/ show what each one does.
+Distances are PDF points (72 pt = 1 inch).
 """
 
 RULES_VERSION = "rules_v1"
-PROMPT_VERSION = "judge_v2"          # v2: the AI lists every block that is yours, not just one
-VERIFY_PROMPT_VERSION = "verify_v1"
+PROMPT_VERSION = "client_judge_v2"      # v2: the AI also lists the company's own signature spots
 
 
-MIN_LINE_WIDTH = 45          # pt. Shorter rules are not signature or date lines.
-# pt. Stamp heights to try, tallest first (0.44 in down to 0.25 in). Wide signatures need the
-# lower heights to fit along a 2-inch line: a 7:1 signature at 20 pt is 140 pt long.
+# =============================================================================
+# Lines, labels and stamps
+# =============================================================================
+
+MIN_LINE_WIDTH = 45          # Shorter rules are not signature or date lines.
+# Stamp heights to try, tallest first (0.44 in down to 0.25 in). Wide signatures need the lower
+# heights to fit along a 2-inch line: a 7:1 signature at 20 pt is 140 pt long.
 SIGNATURE_HEIGHTS = [32, 29, 26, 23, 20, 18]
-DROP_RATIOS = [0.15, 0.08, 0.0]    # Share of the stamp height that sits below the line.
+DROP_RATIOS = [0.15, 0.08, 0.0]    # Share of the stamp height that may sit below the line.
 DATE_FONT_SIZE = 10
-ROW_TOLERANCE = 3.5          # pt. Words whose bottoms are this close share a row.
-SEGMENT_GAP = 12             # pt. A wider gap splits a row into separate labels.
-HEADER_REACH = 70            # pt above a spot to look for its header ("PARTY A").
-BLOCK_REACH = 100            # pt below a spot to look for Name, Title and Date rows.
+ROW_TOLERANCE = 3.5          # Words whose bottoms are this close share a row.
+SEGMENT_GAP = 12             # A wider gap splits a row into separate labels.
+HEADER_REACH = 70            # How far above a spot to look for its header ("PARTY A").
+BLOCK_REACH = 100            # How far below a spot to look for its Name, Title and Date rows.
 MAX_LABEL_WORDS = 6          # A signature label is short: "Service Provider's Signature".
+
+
+# =============================================================================
+# Words
+# =============================================================================
 
 # Words that make a short label a signature label.
 SIGN_WORDS = {"signature", "signed", "sign", "signatory", "signer"}
-# Blocks we must never sign.
+# Blocks nobody signs through AutoSign.
 NEVER_WORDS = {"witness", "witnessed", "notary", "notarial", "guarantor", "surety",
                "attest", "attested", "attestation"}
 # Words that show a "signature" label is not a place to sign.
@@ -39,8 +48,16 @@ FIELD_WORDS = {"name", "print", "printed", "title", "its", "date", "dated", "add
                "signature", "by"}
 # "Company: Acme Inc." rows: a field when a value follows, a header when alone.
 ENTITY_WORDS = {"company", "entity", "organization", "organisation"}
+# The endings of company names ("Acme Analytics Inc.").
+LEGAL_SUFFIXES = {"inc", "incorporated", "llc", "ltd", "limited", "corp", "corporation", "co", "company",
+                  "plc", "gmbh", "ag", "sa", "bv", "pty", "lp", "llp"}
 
-# Roles a party can have. The settings add the company's usual roles.
+
+# =============================================================================
+# Roles and document types
+# =============================================================================
+
+# Roles a party can have in a contract.
 KNOWN_ROLES = ["service provider", "provider", "client", "customer", "company", "consultant",
                "contractor", "independent contractor", "vendor", "supplier", "disclosing party",
                "receiving party", "discloser", "recipient", "party a", "party b", "party 1",
@@ -49,6 +66,12 @@ KNOWN_ROLES = ["service provider", "provider", "client", "customer", "company", 
                "tenant", "lessor", "lessee", "agency", "agent", "partner", "owner", "lender",
                "borrower", "subcontractor", "investor", "distributor", "reseller", "sponsor",
                "principal"]
+
+# Roles a client usually has in the agreement a company sends it. A block that names one of these
+# is the client's (unless the contract gives that role to the sending company).
+CLIENT_ROLES = ["Client", "Customer", "Patient", "Member", "Participant", "Buyer", "Purchaser", "Tenant",
+                "Lessee", "Borrower", "Licensee", "Policyholder", "Insured", "Claimant", "Applicant",
+                "Student", "Subscriber", "Homeowner"]
 
 # Document types: the earliest match on page 1 wins (the title comes first).
 DOC_TYPE_PATTERNS = [
@@ -63,8 +86,11 @@ DOC_TYPE_PATTERNS = [
 ]
 DOC_TYPES = ["nda", "mutual_nda", "service_agreement", "msa", "sow", "employment",
              "operating_agreement", "lease", "other"]
-DOC_TYPE_FAMILY = {"nda": "nda", "mutual_nda": "nda", "service_agreement": "services",
-                   "msa": "services", "sow": "services"}
+
+
+# =============================================================================
+# Red flags: text that means a person must look at the document
+# =============================================================================
 
 # Text that looks like instructions to an AI model (prompt injection).
 INSTRUCTION_PATTERNS = [
@@ -77,7 +103,7 @@ INSTRUCTION_PATTERNS = [
     r"\b(choose|select|pick|answer) (spot|candidate|block|box|option) (number |no\.? |#)?\d",
     r"\bassistant:",
 ]
-# Contract clauses that say how it must be signed. These always go to a person.
+# Contract clauses that say how it must be signed.
 EXECUTION_PATTERNS = [
     r"wet[\s-]ink", r"\bnotari[sz]ed\b", r"notary public", r"executed as a deed",
     r"(signed|executed|delivered)[^.]{0,40}in the presence of", r"in the presence of (a |the )?witness",
@@ -88,14 +114,12 @@ EXECUTION_PATTERNS = [
 # ("...if such filing is made under seal"), which says nothing about how to sign.
 
 
-LEGAL_SUFFIXES = {"inc", "incorporated", "llc", "ltd", "limited", "corp", "corporation", "co", "company",
-                  "plc", "gmbh", "ag", "sa", "bv", "pty", "lp", "llp"}
+# =============================================================================
+# AutoSign
+# =============================================================================
 
-
-EVIDENCE_TEXT = {"name": "your name is in the block", "role": "your role, defined next to your name",
-                 "unnamed_party": "the only party left unnamed", "usual_role": "one of your usual roles",
-                 "empty_block": "still empty after the other party signed",
-                 "page_break": "named only at the bottom of the previous page"}
-STRONG_EVIDENCE = {"name", "role"}
-# Accepted when 'Require your company name' is off. 'page_break' is never enough to auto-sign.
-NAMELESS_EVIDENCE = STRONG_EVIDENCE | {"unnamed_party", "usual_role", "empty_block"}
+DATE_FORMAT = "%b %d, %Y"         # zero-padded day, so every date has the same length
+SIGNATURE_ASPECT = 3.5            # width / height of every stamped signature (each image is padded to it)
+MAX_PAGES = 100                   # bigger agreements are refused
+MAX_MB = 25
+MAX_SIGNATURE_BYTES = 2_000_000   # the signature image sent by the browser

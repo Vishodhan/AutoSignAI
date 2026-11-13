@@ -3,18 +3,29 @@ Test support: the test documents (each with a known right answer) and the helper
 """
 
 import datetime
-import time
+import io
 from pathlib import Path
 
 import pymupdf
+import pytest
 
-from autosign import pipeline, storage
+from autosign import pipeline, storage, workflow
+from autosign.policy import SIGNATURE_ASPECT
 
 # =============================================================================
 # Test documents: each function writes one PDF with a known right answer
 # =============================================================================
 
 DATA = Path(__file__).resolve().parents[1] / "data"     # your sample contracts (the project's data/ folder)
+
+
+def sample(name):
+    """The path of a sample contract in data/. The test is skipped when the file isn't there: the samples
+    aren't in the repository (several are licensed for internal testing only)."""
+    path = DATA / name
+    if not path.exists():
+        pytest.skip(f"data/{name} isn't in this copy of the project")
+    return str(path)
 
 
 def make_test_signature(path):
@@ -186,7 +197,7 @@ def encrypted_doc(folder):
 
 def filled_service_contract(folder, tag=""):
     """Your Service-Contract-Template.pdf with the party names typed into its form fields."""
-    doc = pymupdf.open(DATA / "Service-Contract-Template.pdf")
+    doc = pymupdf.open(sample("Service-Contract-Template.pdf"))
     values = {"with a mailing address of": "Acme Analytics Inc.", "with a mailing address of_2": "Foo Holdings LLC",
               "Service Provider and": "12 Main St, Boston MA", "Client": "99 Elm Rd, Austin TX " + tag}
     for page in doc:
@@ -337,32 +348,23 @@ def two_party_doc(folder, name, preamble, left_header, right_header):
 # Values and helpers shared by the tests
 # =============================================================================
 
-SETTINGS = dict(storage.DEFAULT_SETTINGS)
-ASPECT = 3.3     # width / height of a typical signature image
-# The app reads the signature from settings["signature_file"] (data/signature.png) under AUTOSIGN_HOME.
-TEST_SIGNATURE = storage.HOME / SETTINGS["signature_file"]
-
-
-def spot(analysis, spot_id):
-    return next(s for s in analysis["spots"] if s["id"] == spot_id)
+# The pipeline's own tests look at documents from the side of one party, "ours": Acme Analytics
+# Inc., a service provider. (The app uses the pipeline from the client's side, see
+# workflow.client_settings.)
+SETTINGS = {
+    "company_name": "Acme Analytics Inc.",
+    "company_aliases": ["Acme Analytics"],
+    "usual_roles": ["Service Provider", "Provider", "Consultant", "Receiving Party", "Disclosing Party"],
+    "signer_name": "",
+    "date_format": "%b %d, %Y",
+}
+ASPECT = SIGNATURE_ASPECT     # the shape of every stamp, as in the app
+# The company's signature image the app uses (under the tests' own AUTOSIGN_HOME, see conftest.py).
+TEST_SIGNATURE = storage.COMPANY_SIGNATURE
 
 
 def ours(analysis):
     return [s for s in analysis["spots"] if s["owner"] == "ours"]
-
-
-def agreeing_ai(analysis, settings=SETTINGS):
-    """A stand-in AI answer that agrees with the rules (used where the real model isn't the point)."""
-    picks = [{"signature_spot": s["id"], "date_spot": s["date_id"] or 0, "quote": s["block_text"] or s["label"]}
-             for s in ours(analysis)]
-    return {"ok": True, "digest": "test", "answer": {"document_type": analysis["doc_type"],
-            "our_role": (analysis["parties"] or {}).get("our_role") or "unknown", "picks": picks}}
-
-
-def ai_answer(analysis, picks):
-    """A stand-in AI answer with the given picks: [(spot, date, quote), ...]."""
-    return {"ok": True, "answer": {"document_type": analysis["doc_type"], "our_role": "unknown",
-                                   "picks": [{"signature_spot": s, "date_spot": d, "quote": q} for s, d, q in picks]}}
 
 
 SAMPLES = {
@@ -375,39 +377,96 @@ SAMPLES = {
 }
 
 
-def png_signature():
-    return pipeline.prepare_signature(TEST_SIGNATURE.read_bytes())
-
-
-def sign_proposal(pdf, analysis, out, flatten=False):
-    """Sign every block the rules say is yours. Returns (result, first placement)."""
+def sign_proposal(pdf, analysis, out):
+    """Sign every block the rules say is ours. Returns (result, first placement)."""
     date_text = "Nov 10, 2026"
-    png = png_signature()
-    aspect = pipeline.image_aspect(png)[0]
+    png = workflow.signature_png(TEST_SIGNATURE.read_bytes())
     choices = [{"spot": s["id"], "date": s["date_id"]} for s in ours(analysis)]
-    placements = pipeline.placements_for_spots(analysis, choices, pdf, aspect, date_text)
-    result = pipeline.sign_pdf(pdf, str(out), placements, png, date_text, analysis["mode"], flatten, "Test Signer")
+    placements = pipeline.placements_for_spots(analysis, choices, pdf, ASPECT, date_text)
+    result = pipeline.sign_pdf(pdf, str(out), placements, png, date_text, analysis["mode"], "Test Signer")
     return result, placements[0]
 
 
-def set_auto_sign(client, on):
-    response = client.put("/api/settings", json={"auto_sign": on})
-    assert response.status_code == 200, response.text
+def agreeing_ai(pdf_path, analysis, firm_name):
+    """A stand-in AI answer that agrees with the rules, for the client and for the company."""
+    firm_ids = workflow.find_firm_spots(analysis, firm_name)
+    rules_ids = workflow.find_client_spots_by_rules(analysis)
+    client_ids, _only_the_ai = workflow.choose_client_spots(analysis, rules_ids, [], firm_ids)
+
+    client_picks = []
+    for spot_id in client_ids:
+        spot = next(s for s in analysis["spots"] if s["id"] == spot_id)
+        client_picks.append({"signature_spot": spot_id, "date_spot": spot["date_id"] or 0, "quote": spot["label"]})
+    company_picks = []
+    for spot_id in firm_ids:
+        company_picks.append({"signature_spot": spot_id, "quote": firm_name})
+    answer = {"document_type": analysis["doc_type"], "client_role": "Client", "picks": client_picks,
+              "company_picks": company_picks}
+    return {"ok": True, "model": "stand-in", "seconds": 0, "answer": answer}
 
 
-def upload(client, path, name=None):
+# =============================================================================
+# The web app, as the pages use it
+# =============================================================================
+
+FIRM = "Acme Analytics Inc."
+
+
+def signature_data_url():
+    """A client's signature as the signing page sends it: a PNG data: URL."""
+    import base64
+    from PIL import Image, ImageDraw
+    image = Image.new("RGBA", (420, 120), (0, 0, 0, 0))
+    points = [(10, 90), (60, 20), (110, 100), (170, 30), (230, 95), (300, 35), (410, 80)]
+    ImageDraw.Draw(image).line(points, fill=(10, 10, 60, 255), width=7)
+    out = io.BytesIO()
+    image.save(out, "PNG")
+    return "data:image/png;base64," + base64.b64encode(out.getvalue()).decode("ascii")
+
+
+def upload_agreement(client, path, firm=FIRM, signer="Dana Reyes", expect=200):
+    """Upload an agreement as the home page does. Returns the agreement as the agreement page sees it."""
     data = Path(path).read_bytes()
-    response = client.post("/api/documents", files=[("files", (name or Path(path).name, data, "application/pdf"))],
-                           data={"source": "gui"})
+    files = [("file", (Path(path).name, data, "application/pdf"))]
+    form = {"firm_name": firm, "company_signer": signer, "tz_offset_minutes": "0"}
+    response = client.post("/api/agreements", files=files, data=form)
+    assert response.status_code == expect, response.text
+    if expect != 200:
+        return response.json()
+    token = response.json()["token"]
+    return client.get(f"/api/agreements/{token}").json()
+
+
+def new_client_file(client, agreement, name="Foo Holdings LLC", reference="2026-014"):
+    response = client.post(f"/api/agreements/{agreement['token']}/files",
+                           json={"client_name": name, "reference": reference})
     assert response.status_code == 200, response.text
-    return response.json()["jobs"][0]
+    return response.json()
 
 
-def wait_for(client, job_id, timeout=60):
-    end = time.time() + timeout
-    while time.time() < end:
-        job = client.get(f"/api/jobs/{job_id}").json()
-        if job["status"] not in ("queued", "processing"):
-            return job
-        time.sleep(0.2)
-    raise AssertionError(f"Job {job_id} is still {job['status']}")
+def places_body(agreement, client_spots=None, company_spots=None, company_manual=None):
+    """The body the agreement page sends to confirm the places: the agreement's own, or the ones given."""
+    if client_spots is None:
+        client_spots = agreement["client"]["spots"]
+    if company_spots is None:
+        company_spots = agreement["company"]["spots"]
+    if company_manual is None:
+        company_manual = agreement["company"]["manual"]
+    client_places = {"choices": [{"spot": spot_id} for spot_id in client_spots], "manual": agreement["client"]["manual"]}
+    company_places = {"choices": [{"spot": spot_id} for spot_id in company_spots], "manual": company_manual}
+    return {"client": client_places, "company": company_places, "tz_offset_minutes": 0}
+
+
+def confirm_places(client, agreement, body, expect=200):
+    response = client.put(f"/api/agreements/{agreement['token']}/places", json=body)
+    assert response.status_code == expect, response.text
+    return response.json()
+
+
+def sign_as_client(client, file, name="Jordan Lee", expect=200):
+    token = file["sign_url"].rsplit("/", 1)[1]
+    assert client.get(f"/api/sign/{token}").status_code == 200        # the client opens the link first
+    body = {"signer_name": name, "signature": signature_data_url(), "consent": True, "tz_offset_minutes": 0}
+    response = client.post(f"/api/sign/{token}", json=body)
+    assert response.status_code == expect, response.text
+    return response.json()

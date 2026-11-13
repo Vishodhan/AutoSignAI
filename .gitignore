@@ -11,16 +11,14 @@ __pycache__/
 
 # Created by the app: agreements, signed copies, the audit log
 storage/
+
+# Left over from the first version (a local tool)
 output/
 inbox/
 settings.json
 
-# Any signature image. Never commit one; the tests make their own.
-data/signature.png
-*.signature.png
-
 # Sample contracts: several are licensed for internal testing only (see data/new_samples/SOURCES.md).
-# The tests skip the ones that are missing.
+# The tests skip the ones that are missing. (data/signature.png, the company's signature, is committed.)
 data/*.pdf
 data/new_samples/*.pdf
 

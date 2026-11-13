@@ -1,86 +1,97 @@
-# AutoSignPDF
+# AutoSign
 
-Finds your company's signature block(s) in a contract PDF, has Python rules and a local AI model
-pick them independently, runs an 8-point check, and stamps your signature image and the date on a
-copy. Anything that isn't certain waits in a review queue in the browser. Everything runs on this
-computer; nothing is sent anywhere.
+Every new client has to sign the same agreement before work on their file can start. AutoSign
+automates that:
 
-The design is in `docs/AutoSignPDF_System_Design.html`.
+1. **Upload the agreement once** (PDF). AutoSign finds where the client signs and where your
+   company signs, even in an agreement it has never seen.
+2. **Check the places** when AutoSign isn't sure. It says why, and you choose who signs at each
+   place (or add a place by hand). Nothing is sent until you confirm.
+3. **AutoSign signs for your company** once, on the copy every client will sign.
+4. **Open a client file** (one case for one client) and copy its private signing link to the client.
+5. **The client signs in the browser**: types, draws or uploads a signature and ticks a consent box.
+6. **You get the signed PDF** (both signatures plus a signing certificate page) and an audit log,
+   on a dashboard that shows every client file: link created, opened, signed, and by whom.
 
-## Set up (once)
+There are no accounts and no emails. Each agreement page and each signing link is a long random
+secret, and you send the signing link yourself. Use test data only.
 
-1. Install [uv](https://docs.astral.sh/uv/) and [Ollama](https://ollama.com).
-2. In this folder: `uv sync` (creates `.venv` with Python 3.13 and every package).
-3. `ollama pull qwen3.5:4b`, then make the 32k-context variant the app uses: save a file named
-   `Modelfile` with the two lines `FROM qwen3.5:4b` and `PARAMETER num_ctx 32768`, and run
-   `ollama create qwen3.5-4b-32k -f Modelfile` (it reuses the same weights, so no extra space).
-   Set `OLLAMA_FLASH_ATTENTION=1` and `OLLAMA_KV_CACHE_TYPE=q8_0`, then restart Ollama: they keep
-   the 32k context within a 6 GB GPU. The model and context size can be changed in Settings.
-4. Put your signature image at `data/signature.png` (PNG or JPG; a white background is removed
-   automatically). Without it, nothing is signed.
-
-## Run
+## Run it locally
 
 ```
-uv run autosign
+uv sync                 # Python 3.13 and every package, in .venv
+uv run autosign         # http://127.0.0.1:8000 (API documentation at /docs)
 ```
 
-(`uv run python -m autosign.app` does the same.)
+Run it from the project folder: AutoSign reads `.env`, `data/` and `storage/` there.
 
-Open http://127.0.0.1:8000. API documentation: http://127.0.0.1:8000/docs.
+- **Your company's signature** is `data/signature.png` (PNG or JPEG; a white background is
+  removed automatically). `COMPANY_SIGNATURE_FILE` points at another image. Without one, AutoSign
+  says so and only the client signs.
+- **The AI check (optional):** put `GEMINI_API_KEY=...` in a `.env` file in this folder. Without a
+  key everything still works, but every agreement asks you to confirm the places.
 
-- **Upload** PDFs in the GUI, or put them in `inbox/` and click **Process inbox** on the Dashboard.
-- Documents that pass all 8 checks are signed automatically **only when Auto-sign is on** in
-  Settings. It starts off (shadow mode): every document waits in **Review**, where you approve,
-  pick other spots, place the signature by hand, or reject.
-- Signed PDFs go to `output/<name>-signed.pdf` (and stay downloadable from **History**). The
-  ledger (`storage/ledger.db`) records every document; **Export to Excel** saves it as a workbook.
-
-Set your company name, its other names, the roles you usually have and the date format in
-**Settings**. "Require your company name" makes auto-sign stricter: only documents that contain
-your name are signed without a person.
-
-Programs calling the API must send the header `X-AutoSign: 1` with POST and PUT requests. The app
-answers only on 127.0.0.1, so other websites in your browser can't use it.
-
-## Test
+## Tests
 
 ```
-uv run pytest              # fast tests: rules, signing, client-signed PDFs, the API (no AI needed)
-uv run pytest -m live -s   # live tests with the real models in Ollama (prints time per answer)
+uv run pytest              # no AI key needed: the tests make their own PDFs
+uv run pytest -m live -s   # also asks Gemini (needs GEMINI_API_KEY)
 ```
 
-The tests build their own PDFs (filled contracts, side-by-side and multi-page blocks, traps,
-client-signed copies at each lock level) and also run on the five samples in `data/`.
+Tests that use the sample PDFs in `data/` skip when those files aren't there (they aren't in the
+repository; several are licensed for internal testing only).
 
-## Project layout
+## Deploy on Railway
+
+1. New project → **Deploy from GitHub repo** → this repository. Railway builds it from
+   `pyproject.toml` and `uv.lock` (no Dockerfile); `railway.json` holds the start command and the
+   health check. The company's signature image comes with the code (`data/signature.png`).
+2. Add a **volume** mounted at `/data` (it keeps the database, the PDFs and the audit log across deploys).
+3. **Variables**: `AUTOSIGN_HOME=/data`, and `GEMINI_API_KEY` for the AI check.
+4. **Settings → Networking → Generate Domain** for the public `*.up.railway.app` address.
+
+## How it works
+
+**Finding the places.** PyMuPDF reads the exact positions of the words, lines, boxes and form
+fields. Rules find every signature spot and date spot, and decide whose each one is from the
+agreement's own party definitions (for example *Acme Inc. (the "Provider") and the client (the
+"Client")*). Google Gemini gets the same numbered spots, as text and as pictures, and says which
+are the client's and which are the company's. Gemini never gives coordinates: it only chooses
+among the numbered spots, so a stamp's position always comes from the PDF itself.
+
+AutoSign is **sure** only when the rules and Gemini agree, every stamp fits without covering text,
+and nothing in the PDF needs a person's eye (hidden text, instructions aimed at an AI, JavaScript,
+special signing rules such as wet ink or a notary). Otherwise the agreement page lists the reasons,
+and the company chooses who signs where before any link can be created. PDFs whose digital
+certification forbids adding a signature are refused.
+
+**Signing.** Each signature is cleaned (background removed, cropped, padded to the stamp's shape)
+and stamped at its place with the date. After every stamp, the signed copy is checked against the
+one before it: the signature and the date are where they should be, and nothing else on any page
+changed. A copy that fails a check is never kept. PDFs that already carry digital signatures are
+only changed append-only, so those signatures stay valid.
+
+**The record.** The signed PDF ends with a signing certificate: who signed for each side, when,
+from which IP address and browser, the consent text, and the SHA-256 of the agreement before
+signing. Every step is a row in `storage/audit-log.csv`, and each row carries the hash of the row
+before it, so an edited or deleted row is detected. `/verify` tells whether a PDF is exactly a
+copy AutoSign signed.
+
+## Layout
 
 ```
-AutoSignPDF/
-├── pyproject.toml            dependencies, the `autosign` command, test settings
-├── src/autosign/             the code (an installable package)
-│   ├── pipeline.py           the four steps, one section each: Parse -> Detect -> Verify -> Sign
-│   │                         (plus page previews and cleaning the signature image)
-│   ├── ai.py                 the local model: its second opinion, and its look at the signed page
-│   ├── policy.py             every word list, distance and limit the rules use (tune the rules here)
-│   ├── storage.py            folders, settings, the SQLite ledger, the audit log, Excel export
-│   ├── app.py                intake (upload, inbox), the job queue, the REST API; main() starts it
-│   ├── __init__.py           marks the folder as a package; lists the modules
-│   └── static/index.html     the GUI (HTML, CSS and JavaScript, no libraries)
-├── tests/
-│   ├── conftest.py           test setup: a throwaway data folder and shared fixtures
-│   ├── helpers.py            builds the test PDFs (each with a known right answer); shared helpers
-│   ├── test_pipeline.py      the four steps on your samples and generated documents; live AI tests
-│   └── test_app.py           the web app: uploads, review actions, security, the worker
-├── data/                     your sample contracts and signature.png
-├── docs/                     the design plan
-├── settings.json             your settings (written by the Settings screen)
-└── inbox/, output/, storage/ incoming PDFs, signed PDFs, the app's records (created on first run)
+src/autosign/
+  app.py        the web app: pages and REST API (/docs)
+  workflow.py   who signs where (rules + AI), signing for the company and the client, the certificate page
+  pipeline.py   reading the PDF, finding signature spots, stamping and checking (PyMuPDF)
+  ai.py         Gemini's second opinion on whose each spot is
+  storage.py    SQLite for agreements and client files; the hash-chained audit log (CSV)
+  policy.py     word lists, roles and limits
+  static/       the pages (plain HTML, CSS and JavaScript)
+tests/          pytest
 ```
 
-## Not handled in this version
+## Tools
 
-- Scanned PDFs (no text layer) are rejected.
-- Pages that are rotated go to review; placing by hand doesn't work on them.
-- If the client certified the PDF with lock level 1 it is rejected; lock level 2 waits for review
-  (both would need a certificate signature, which this version doesn't make).
+Python 3.13, FastAPI, PyMuPDF, pyHanko, Pillow, Google Gemini (`gemini-3.1-flash-lite`), uv,
+Railway. Built with Claude Code as the AI coding assistant.

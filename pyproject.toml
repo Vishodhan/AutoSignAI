@@ -1,18 +1,16 @@
 [project]
 name = "autosignpdf"
 version = "1.0.0"
-description = "Finds your company's signature blocks in contract PDFs and stamps your signature and the date, locally."
+description = "Upload your client agreement once; AutoSign signs it for your company, and each client signs it in the browser through a private link."
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "fastapi>=0.162.4",
-    "ollama>=0.6.3",
-    "openpyxl>=3.1.5",
+    "google-genai>=1.0.0",
     "pillow>=13.0.0",
     "pyhanko>=0.38.1",
     "pymupdf>=2.1",
     "python-multipart>=0.0.33",
-    "rapidfuzz>=3.14.6",
     "uvicorn>=0.54.0",
 ]
 
@@ -34,5 +32,5 @@ module-name = "autosign"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-markers = ["live: needs Ollama running with the model (run: uv run pytest -m live -s)"]
+markers = ["live: calls Google Gemini (needs GEMINI_API_KEY; run: uv run pytest -m live -s)"]
 addopts = "-m 'not live'"

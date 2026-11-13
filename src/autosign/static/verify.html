@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>Check a signed copy: AutoSign</title>
+<link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+<header>
+  <div class="bar">
+    <a class="brand" href="/">AutoSign <small>client agreements, signed on every file</small></a>
+    <nav><a href="/">Upload an agreement</a></nav>
+  </div>
+</header>
+
+<main class="narrow">
+  <section class="card">
+    <h1>Check a signed copy</h1>
+    <p class="muted">Choose a signed PDF. AutoSign works out its fingerprint (SHA-256) and looks it up in the audit log.
+      A match means the file is exactly the copy AutoSign produced when the client signed: not one byte has changed.
+      The file is only read to compute the fingerprint; it isn't kept.</p>
+    <form class="stack" id="verify">
+      <label class="field">The signed PDF
+        <input type="file" id="file" name="file" required accept=".pdf,application/pdf">
+      </label>
+      <div class="row"><button class="btn primary" type="submit" id="submit">Check it</button></div>
+    </form>
+  </section>
+  <section class="card" id="result" hidden></section>
+</main>
+
+<footer>AutoSign. Test data only: don't upload real people's personal information.</footer>
+
+<script src="/static/common.js"></script>
+<script>
+"use strict";
+
+function showResult(result) {
+  const box = document.getElementById("result");
+  box.hidden = false;
+  let logLine = "The audit log is intact.";
+  if (!result.log_intact) {
+    logLine = "Warning: the audit log has been changed since it was written.";
+  }
+  if (result.match) {
+    let client = result.client_name;
+    if (result.reference) {
+      client += ` (ref. ${result.reference})`;
+    }
+    box.innerHTML = `<div class="banner good"><b>This is a genuine signed copy.</b></div>
+      <dl class="kv spaced">
+        <dt>Agreement</dt><dd>${esc(result.document)}</dd>
+        <dt>Sent by</dt><dd>${esc(result.firm_name)}</dd>
+        <dt>Client file</dt><dd>${esc(client)}</dd>
+        <dt>Signed by</dt><dd>${esc(result.signer_name)}</dd>
+        <dt>Signed at</dt><dd>${esc(result.signed_at)}</dd>
+        <dt>SHA-256</dt><dd class="mono">${esc(result.sha256)}</dd>
+      </dl>
+      <p class="muted small spaced">${esc(logLine)}</p>`;
+  } else {
+    box.innerHTML = `<div class="banner bad"><b>No match.</b> This file isn't a copy signed through AutoSign,
+      or it was changed after signing.</div>
+      <dl class="kv spaced"><dt>SHA-256</dt><dd class="mono">${esc(result.sha256)}</dd></dl>
+      <p class="muted small spaced">${esc(logLine)}</p>`;
+  }
+}
+
+const form = document.getElementById("verify");
+form.addEventListener("submit", (event) => {
+  event.preventDefault();
+  run(async () => {
+    const submit = document.getElementById("submit");
+    submit.disabled = true;
+    try {
+      const result = await api("/api/verify", { method: "POST", body: new FormData(form) });
+      showResult(result);
+    } finally {
+      submit.disabled = false;
+    }
+  });
+});
+</script>
+</body>
+</html>

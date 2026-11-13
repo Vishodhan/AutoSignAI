@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>AutoSign: your client agreement, signed on every file</title>
+<link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+<header>
+  <div class="bar">
+    <a class="brand" href="/">AutoSign <small>client agreements, signed on every file</small></a>
+    <nav><a href="/verify">Check a signed copy</a><a href="/docs">API</a></nav>
+  </div>
+</header>
+
+<main class="narrow">
+  <section class="card">
+    <h1>Get your client agreement signed on every file</h1>
+    <p class="muted">Upload the agreement (as a PDF) that every new client must sign. AutoSign finds where your company
+      signs and where the client signs, even in an agreement it has never seen, and signs it for your company.
+      Then, for each new client file, you copy a signing link and send it. The client signs in the browser,
+      and you get the signed PDF.</p>
+    <ol class="steps">
+      <li><b>Upload</b> your agreement as a PDF, once.</li>
+      <li><b>Check</b> the signature places AutoSign found. It asks you to confirm whenever it isn't sure.</li>
+      <li><b>AutoSign signs for your company</b>, once, on the copy every client will sign.</li>
+      <li><b>Open a client file</b> (one per client case) and copy its signing link to the client.</li>
+      <li><b>The client signs</b>; the signed PDF and the audit log are on your agreement page.</li>
+    </ol>
+  </section>
+
+  <section class="card">
+    <h2>1. Upload your client agreement</h2>
+    <form id="upload" class="stack">
+      <label class="field">Your company's name
+        <input type="text" id="firm" name="firm_name" required minlength="2" maxlength="120" placeholder="e.g. Astra AI" autocomplete="organization">
+        <span class="hint">As it is written in the agreement. It tells AutoSign which signature block is yours, not the client's.</span>
+      </label>
+      <label class="field">Who signs for your company (optional)
+        <input type="text" id="signer" name="company_signer" maxlength="100" placeholder="e.g. Dana Reyes, Director" autocomplete="name">
+        <span class="hint">Shown on the signing certificate. AutoSign signs with your company's signature image set up on the server.</span>
+      </label>
+      <label class="field">The agreement (PDF)
+        <input type="file" id="file" name="file" required accept=".pdf,application/pdf">
+        <span class="hint">PDF only, up to 25 MB and 100 pages. Word files: save as PDF first. Use test documents only.</span>
+      </label>
+      <div class="row">
+        <button class="btn primary" type="submit" id="submit">Upload and find the signature places</button>
+        <span class="muted small" id="busy" hidden>Reading the agreement and finding where the client signs. This takes up to a minute.</span>
+      </div>
+    </form>
+  </section>
+
+  <section class="card small muted">
+    There are no accounts. After uploading you get a private page for the agreement: <b>bookmark it</b>,
+    because it is the only way back to your agreement and its client files. Anyone you give a link to can open it.
+  </section>
+</main>
+
+<footer>AutoSign. Test data only: don't upload real people's personal information.</footer>
+
+<script src="/static/common.js"></script>
+<script>
+"use strict";
+
+const form = document.getElementById("upload");
+
+form.addEventListener("submit", (event) => {
+  event.preventDefault();
+  run(async () => {
+    const submit = document.getElementById("submit");
+    const busy = document.getElementById("busy");
+    const data = new FormData(form);
+    // The date written next to your company's signature is today's date where you are.
+    data.append("tz_offset_minutes", String(-new Date().getTimezoneOffset()));
+    submit.disabled = true;
+    busy.hidden = false;
+    try {
+      const result = await api("/api/agreements", { method: "POST", body: data });
+      location.href = result.url;
+    } finally {
+      submit.disabled = false;
+      busy.hidden = true;
+    }
+  });
+});
+</script>
+</body>
+</html>

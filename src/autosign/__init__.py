@@ -1,14 +1,11 @@
 """
-AutoSignPDF: finds your company's signature blocks in a contract PDF and stamps your signature and the date.
+AutoSign: a company uploads its client agreement once, AutoSign signs it for the company, and each
+new client signs it in the browser through a private link.
 
-    pipeline.py   the four steps: Parse -> Detect -> Verify -> Sign (plus page previews and the
-                  signature image)
-    ai.py         the local model: its second opinion on the spots, and its look at the signed page
-    policy.py     every word list, distance and limit the rules use (tune the rules here)
-    storage.py    folders, settings, the SQLite ledger, the audit log and the Excel export
-    app.py        intake, the job queue and worker, the REST API and the GUI page; `main()` starts it
-
-Start it with `uv run autosign`.
+    app.py        the web app: the pages and the REST API; `main()` starts it (uv run autosign)
+    workflow.py   who signs where (rules + AI), signing for the company and for the client, the certificate
+    pipeline.py   reading the PDF, finding the signature spots, stamping a copy and checking it
+    ai.py         Gemini's second opinion on whose each spot is
+    storage.py    the SQLite database, the stored PDFs and the hash-chained audit log
+    policy.py     every word list, distance and limit the rules use
 """
-
-__version__ = "1.0"

@@ -1,0 +1,4 @@
+# Text files are stored with LF line endings, whatever the editor uses.
+* text=auto eol=lf
+*.pdf binary
+*.png binary
