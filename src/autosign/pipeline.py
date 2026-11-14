@@ -1,10 +1,11 @@
 """
-Reading a PDF, finding its signature spots, and stamping a signature on a copy.
+Reading a PDF and finding its signature spots: their blocks, dates and name lines, and exactly
+where each signature goes (DocuSeal's fields are placed there).
 
     Parse    read_page(): the words, lines, form fields and drawings of one page
     Detect   analyze(): the signature spots, their blocks and dates, who owns each, where a stamp
              fits, and the red flags that need a person's eye
-    Sign     placements_for_spots() and sign_pdf(): stamp a copy of the PDF, then check the copy
+    Place    placements_for_spots(): the exact rectangles of the signatures and their dates
 
 The rules judge every block from the side of one party, called "ours" (and "you" in the texts).
 `settings` describes that party: its name and aliases, the roles it usually has, and the names of
@@ -15,23 +16,18 @@ reports them. A rectangle is a list [x0, y0, x1, y1]. Every function takes and r
 values (dicts, lists, strings, numbers), so each result can be stored as JSON.
 """
 
-import json
-import os
 import re
-import shutil
 import time
 from pathlib import Path
 
 import pymupdf
 from pyhanko.pdf_utils.reader import PdfFileReader
-from pyhanko.sign.validation import validate_pdf_signature
-from pyhanko_certvalidator import ValidationContext
 
 from autosign.policy import (
-    BLOCK_REACH, DATE_FONT_SIZE, DOC_TYPE_PATTERNS, DROP_RATIOS, ENTITY_WORDS, EXECUTION_PATTERNS, FIELD_WORDS,
-    HEADER_REACH, INSTRUCTION_PATTERNS, KNOWN_ROLES, LEGAL_SUFFIXES, MAX_LABEL_WORDS, MIN_LINE_WIDTH, NEVER_WORDS,
-    NOT_A_SPOT_WORDS, NOT_SIGNING_DATE_WORDS, ROW_TOLERANCE, RULES_VERSION, SEGMENT_GAP, SIGN_WORDS,
-    SIGNATURE_HEIGHTS,
+    BLOCK_REACH, DATE_FONT_SIZES, DOC_TYPE_PATTERNS, DROP_RATIOS, ENTITY_WORDS, EXECUTION_PATTERNS, FIELD_WORDS,
+    HEADER_REACH, INSTRUCTION_PATTERNS, KNOWN_ROLES, LEGAL_SUFFIXES, MAX_LABEL_WORDS, MIN_LINE_WIDTH,
+    NAME_LABEL_WORDS, NEVER_WORDS, NOT_A_SPOT_WORDS, NOT_SIGNING_DATE_WORDS, ROW_TOLERANCE, RULES_VERSION,
+    SEGMENT_GAP, SIGN_WORDS, SIGNATURE_HEIGHTS,
 )
 
 # =============================================================================
@@ -173,12 +169,12 @@ def has_signature_fields(doc):
 
 
 def signature_state(pdf_path, doc=None):
-    """The digital signatures already in the PDF, the lock level they set, and how a stamp may be added.
+    """The digital signatures already in the PDF, and the lock level they set.
 
     Always read from the file, never only when /SigFlags is set: some PDFs leave it out. 'blocked'
     says why the PDF must not be signed. 'mode' is 'annotation' for PDFs that are (or may be)
-    digitally signed: each stamp goes on as an annotation, with an append-only save, so their
-    signed bytes stay untouched. Other PDFs get 'content': the stamps are drawn into the page.
+    digitally signed and 'content' for the others; AutoSign refuses the digitally signed ones
+    (workflow.detect), because DocuSeal removes a PDF's own signature fields.
     """
     try:
         signatures = read_signatures(pdf_path)
@@ -215,22 +211,6 @@ def signature_state(pdf_path, doc=None):
     if signatures or unreadable is not None:
         mode = "annotation"
     return {"signatures": signatures, "lock_level": lock, "blocked": blocked, "mode": mode}
-
-
-def validate_signatures(pdf_path):
-    """Check every digital signature: are the signed bytes untouched and the maths valid?
-
-    Whether the signer's certificate is trusted is a separate question this check doesn't ask,
-    so no trust list is loaded (an empty one is passed on purpose).
-    """
-    results = []
-    with open(pdf_path, "rb") as f:
-        reader = PdfFileReader(f, strict=False)
-        for signature in reader.embedded_signatures:
-            status = validate_pdf_signature(signature, signer_validation_context=ValidationContext(trust_roots=[]),
-                                            skip_diff=True)
-            results.append({"field": signature.field_name, "intact": bool(status.intact), "valid": bool(status.valid)})
-    return results
 
 
 # =============================================================================
@@ -930,7 +910,7 @@ def drop_duplicate_spots(spots):
 
 
 def find_spots(page, rows):
-    """Find every signature spot and 'Date' label on a page. Returns (spots, date labels)."""
+    """Find every signature spot, 'Date' label and 'Name' label on a page. Returns (spots, date labels, name labels)."""
     segments = make_segments(rows)
     used = set()            # ids of the labels that already have a spot
     # The order matters: each kind of spot only takes labels the kinds before it left unused.
@@ -939,7 +919,8 @@ def find_spots(page, rows):
     spots += box_spots(page, segments, used)
     spots += lone_label_spots(page, segments, rows, used)
     date_segments = [seg for seg in segments if seg["kind"] == "date"]
-    return drop_duplicate_spots(spots), date_segments
+    name_segments = [seg for seg in segments if seg["kind"] == "text" and is_name_label(seg["text"])]
+    return drop_duplicate_spots(spots), date_segments, name_segments
 
 
 # =============================================================================
@@ -1113,14 +1094,36 @@ def starts_right_after(seg, rect):
     return after_the_label and on_its_row
 
 
-def date_target(seg, page):
-    """What to fill for a 'Date' label: a form field next to it, its line, or blank space after it."""
+def field_target(field):
+    return {"kind": "field", "area": rounded(field["rect"]), "field_name": field["name"],
+            "field_xref": field["xref"], "value": field["value"]}
+
+
+def field_on_line(page, line):
+    """A text form field drawn on a line (its bottom edge on the line, over most of its length), or None."""
+    line_length = line["x1"] - line["x0"]
+    for field in page["fields"]:
+        if field["kind"] != "text":
+            continue
+        x0, _top, x1, bottom = field["rect"]
+        on_the_line = abs(bottom - line["y"]) <= 4
+        overlap = min(x1, line["x1"]) - max(x0, line["x0"])
+        if on_the_line and overlap >= line_length / 2:
+            return field
+    return None
+
+
+def label_target(seg, page):
+    """What to fill for a 'Date' or 'Name' label: a form field next to it, its line (or the form field
+    on that line), or blank space after it."""
     for field in page["fields"]:
         if field["kind"] == "text" and starts_right_after(seg, field["rect"]):
-            return {"kind": "field", "area": rounded(field["rect"]), "field_name": field["name"],
-                    "field_xref": field["xref"], "value": field["value"]}
+            return field_target(field)
     for line in page["lines"]:
         if line.get("left") is seg or line.get("below") is seg:
+            field = field_on_line(page, line)
+            if field is not None:
+                return field_target(field)
             area = [line["x0"], line["y"] - 12, line["x1"], line["y"] + 2]
             return {"kind": "line", "area": rounded(area), "line": line_coords(line)}
     area = [seg["x1"] + 4, seg["y0"], seg["x1"] + 84, seg["y1"]]
@@ -1128,7 +1131,7 @@ def date_target(seg, page):
 
 
 def in_block_below(seg, spot):
-    """A 'Date' label on one of the rows of the spot's block, below the spot."""
+    """A label on one of the rows of the spot's block, below the spot."""
     if seg["y0"] < spot["bottom"] - 2:
         return False
     for row in spot["_block_rows"]:
@@ -1137,34 +1140,89 @@ def in_block_below(seg, spot):
     return False
 
 
-def find_date_for(spot, page, date_segments):
-    """The date that belongs to a signature spot: on its row to the right, or in its block below."""
+def signature_row(spot):
+    """Where a spot's signature sits: (row_y, left_edge, right_edge) of its line, or of its area."""
     if spot["line"]:
-        row_y = spot["line"][1]
-        right_edge = spot["line"][2]
-    else:
-        row_y = spot["area"][3] - 4
-        right_edge = spot["area"][2]
+        return spot["line"][1], spot["line"][0], spot["line"][2]
+    return spot["area"][3] - 4, spot["area"][0], spot["area"][2]
 
-    candidates = []         # (distance, 'Date' label)
-    for seg in date_segments:
+
+def labels_near(spot, segments):
+    """(distance, label) for every label on the spot's row to its right, or in its block below.
+
+    Distances are measured from the left edge of the signature, where a reader starts. Blocks side by
+    side share their text rows, so both columns' labels are in each block; measured from the left,
+    each signature keeps the label of its own column.
+    """
+    row_y, left_edge, right_edge = signature_row(spot)
+    candidates = []
+    for seg in segments:
         same_row = abs(seg["y1"] - row_y) <= 6 and right_edge - 5 <= seg["x0"] <= right_edge + 250
         if same_row or in_block_below(seg, spot):
-            distance = abs(seg["y1"] - row_y) + abs(seg["x0"] - right_edge) * 0.2
+            distance = abs(seg["y1"] - row_y) + abs(seg["x0"] - left_edge) * 0.2
             candidates.append((distance, seg))
+    return candidates
+
+
+def located(seg, page):
+    """What to fill for a label, and where the label is."""
+    target = label_target(seg, page)
+    target.update(page=page["number"], label=seg["text"], label_rect=rounded(rect_of(seg)))
+    return target
+
+
+def nearest(candidates):
+    return min(candidates, key=lambda candidate: candidate[0])[1]
+
+
+def find_date_for(spot, page, date_segments):
+    """The date that belongs to a signature spot: on its row to the right, or in its block below."""
+    candidates = labels_near(spot, date_segments)
     if spot["line"]:
+        row_y, left_edge, right_edge = signature_row(spot)
         # A date line on the same row whose 'Date' label is printed under it.
         for line in page["lines"]:
             if line["role"] != "date" or not line.get("below"):
                 continue
             if abs(line["y"] - row_y) <= 4 and right_edge - 5 <= line["x0"] <= right_edge + 250:
-                candidates.append((abs(line["x0"] - right_edge) * 0.2, line["below"]))
+                candidates.append((abs(line["x0"] - left_edge) * 0.2, line["below"]))
     if not candidates:
         return None
+    return located(nearest(candidates), page)
 
-    seg = min(candidates, key=lambda candidate: candidate[0])[1]
-    target = date_target(seg, page)
-    target.update(page=page["number"], label=seg["text"], label_rect=rounded(rect_of(seg)))
+
+def is_name_label(text):
+    """'Name:', 'Print Name', 'Printed name', 'Name of signatory': where the signer's printed name goes."""
+    toks = tokens(text)
+    if "name" not in toks or len(toks) > 4:
+        return False
+    for tok in toks:
+        if tok not in NAME_LABEL_WORDS:
+            return False
+    return True
+
+
+def nothing_written(target, page):
+    """Nothing is written yet where a name would go: no form field value, and no word on its line."""
+    if target["kind"] == "field":
+        return not str(target.get("value") or "").strip()
+    x0, y0, x1, y1 = target["area"]
+    for word in page["words"]:
+        inside = word["x0"] >= x0 - 1 and word["x1"] <= x1 + 1 and word["y0"] >= y0 - 1 and word["y1"] <= y1 + 2
+        if inside:
+            return False
+    return True
+
+
+def find_name_for(spot, page, name_segments):
+    """Where the signer's printed name goes in a spot's block ('Name: ____', or 'Print Name' under a
+    line), or None. A name line that already has something on it is left alone."""
+    candidates = labels_near(spot, name_segments)
+    if not candidates:
+        return None
+    target = located(nearest(candidates), page)
+    if not nothing_written(target, page):
+        return None
     return target
 
 
@@ -1657,29 +1715,32 @@ def spot_is_empty(page, spot, rect):
 
 
 def place_date(page, date, date_text):
-    """Where the date text goes. A form field gets a value; a line or blank gets text."""
+    """Where the date text goes. A form field gets a value; a line or blank gets text, at the largest
+    size of DATE_FONT_SIZES that fits."""
     if date["kind"] == "field":
         if date.get("value"):
             return {"fits": False, "kind": "field", "reason": f"the date field already contains '{date['value']}'"}
         return {"fits": True, "kind": "field", "rect": date["area"], "field_xref": date["field_xref"],
                 "field_name": date["field_name"]}
-    width = pymupdf.get_text_length(date_text, fontname="helv", fontsize=DATE_FONT_SIZE)
     if date["kind"] == "line":
         x0, y, x1 = date["line"]
         x = x0 + 3
         baseline = y - 2
-        limit = x1 + 2
+        limit = x1 + 2              # the date stays on its line
         obstacles = obstacles_for(page, skip_line=date["line"])
     else:  # blank space after the label
         label = date["label_rect"]
         x = label[2] + 6
         baseline = label[3] - 0.22 * (label[3] - label[1])
-        limit = x + width + 1
+        limit = page["width"]       # no line: only the page edge (and what is written there) limits it
         obstacles = obstacles_for(page)
-    rect = [x, baseline - DATE_FONT_SIZE * 0.8, x + width, baseline + DATE_FONT_SIZE * 0.22]
-    if x + width > limit or not is_free(rect, obstacles, page):
-        return {"fits": False, "kind": "text", "reason": "the date doesn't fit next to the Date label"}
-    return {"fits": True, "kind": "text", "point": [round(x, 1), round(baseline, 1)], "rect": rounded(rect)}
+    for size in DATE_FONT_SIZES:
+        width = pymupdf.get_text_length(date_text, fontname="helv", fontsize=size)
+        rect = [x, baseline - size * 0.8, x + width, baseline + size * 0.22]
+        if x + width <= limit and is_free(rect, obstacles, page):
+            return {"fits": True, "kind": "text", "point": [round(x, 1), round(baseline, 1)], "rect": rounded(rect),
+                    "size": size}
+    return {"fits": False, "kind": "text", "reason": "the date doesn't fit next to the Date label"}
 
 
 # =============================================================================
@@ -1756,32 +1817,53 @@ def document_notes(pages, spots):
     if initial_pages:
         notes.append(f"Initials are requested on {initial_pages} page(s); they are left blank")
     for spot in spots:
-        if spot["owner"] == "ours" and re.search(r"\b(name|title)\b", norm(spot["below"])):
-            notes.append(f"Spot {spot['id']}: the printed name and title lines are left blank")
+        if spot["owner"] == "ours" and re.search(r"\btitle\b", norm(spot["below"])):
+            notes.append(f"Spot {spot['id']}: the title line is left blank")
     return notes
 
 
-def detect_spots(pages, all_rows, date_text):
-    """Every spot of the document with its block, numbered in reading order; then their dates, numbered after them.
+def number_names(spots, spot_names, first_id):
+    """Number the name lines found for the spots, from first_id. A line two spots both found is kept
+    for both: workflow.overlap_problems then asks the company to check the places."""
+    names = []
+    for spot, name in zip(spots, spot_names):
+        spot["name_id"] = None
+        if name is None:
+            continue
+        name["id"] = first_id + len(names)
+        name["spot_id"] = spot["id"]
+        names.append(name)
+        spot["name_id"] = name["id"]
+    return names
 
-    Returns (spots, dates). Each spot's 'date_id' points at its date (or is None).
+
+def detect_spots(pages, all_rows, date_text):
+    """Every spot of the document with its block, numbered in reading order; then their dates, then
+    their name lines, numbered after them.
+
+    Returns (spots, dates, names). Each spot's 'date_id' and 'name_id' point at its date and at the
+    line for the signer's printed name (or are None).
     """
     spots = []
     spot_dates = []         # the date found for each spot, or None
+    spot_names = []         # the name line found for each spot, or None
     for index, page in enumerate(pages):
         rows = all_rows[index]
         previous_rows = []
         if index > 0:
             previous_rows = all_rows[index - 1]
-        page_spots, date_segments = find_spots(page, rows)
+        page_spots, date_segments, name_segments = find_spots(page, rows)
         build_blocks(page, rows, page_spots, previous_rows)
         for spot in page_spots:
             date = None
+            name = None
             if spot["kind"] == "signature":
                 date = find_date_for(spot, page, date_segments)
+                name = find_name_for(spot, page, name_segments)
             del spot["_block_rows"]
             spots.append(spot)
             spot_dates.append(date)
+            spot_names.append(name)
 
     for number, spot in enumerate(spots, start=1):
         spot["id"] = number
@@ -1795,7 +1877,8 @@ def detect_spots(pages, all_rows, date_text):
         date["placement"] = place_date(pages[date["page"] - 1], date, date_text)
         dates.append(date)
         spot["date_id"] = date["id"]
-    return spots, dates
+    names = number_names(spots, spot_names, len(spots) + len(dates) + 1)
+    return spots, dates, names
 
 
 def judge_spot(spot, page, parties, settings, aspect):
@@ -1872,7 +1955,7 @@ def analyze(pdf_path, settings, aspect):
             words = [word for word in page["words"] if not word.get("boiler")]
             all_rows.append(group_rows(words))
         parties = find_parties(all_rows, settings)
-        spots, dates = detect_spots(pages, all_rows, time.strftime(settings["date_format"]))
+        spots, dates, names = detect_spots(pages, all_rows, time.strftime(settings["date_format"]))
         for spot in spots:
             judge_spot(spot, pages[spot["page"] - 1], parties, settings, aspect)
         resolve_owners(spots)
@@ -1891,6 +1974,7 @@ def analyze(pdf_path, settings, aspect):
         "parties": parties,
         "spots": spots,
         "dates": dates,
+        "names": names,
         "red_flags": flags,
         "notes": notes,
         "signatures": state["signatures"],
@@ -1906,7 +1990,8 @@ def analyze(pdf_path, settings, aspect):
 # =============================================================================
 
 def placement_for_spot(spot, date_id, page, analysis, aspect, date_text):
-    """The stamp (and date) for one chosen spot on a freshly read page. Raises ValueError when it can't go there."""
+    """The stamp (and date) for one chosen spot on a freshly read page. Raises ValueError when the
+    signature can't go there. A date that doesn't fit is left off: 'date_left_off' then says why."""
     signature = place_signature(page, spot, aspect)
     if not signature["fits"]:
         raise ValueError(f"Spot {spot['id']}: {signature['reason']}")
@@ -1914,7 +1999,7 @@ def placement_for_spot(spot, date_id, page, analysis, aspect, date_text):
     if not empty:
         raise ValueError(f"Spot {spot['id']}: {why}")
     placement = {"page": spot["page"], "signature": signature["rect"], "spot_id": spot["id"], "date": None,
-                 "date_id": None, "manual": False}
+                 "date_id": None, "date_left_off": None, "manual": False}
     if date_id:
         date = find_by_id(analysis["dates"], date_id)
         if date is None:
@@ -1922,10 +2007,11 @@ def placement_for_spot(spot, date_id, page, analysis, aspect, date_text):
         if date["page"] != spot["page"]:
             raise ValueError(f"Date spot {date['id']} isn't on the same page as spot {spot['id']}")
         placed = place_date(page, date, date_text)
-        if not placed["fits"]:
-            raise ValueError(f"Date spot {date['id']}: {placed['reason']}")
-        placement["date"] = placed
-        placement["date_id"] = date["id"]
+        if placed["fits"]:
+            placement["date"] = placed
+            placement["date_id"] = date["id"]
+        else:
+            placement["date_left_off"] = placed["reason"]
     return placement
 
 
@@ -1964,183 +2050,10 @@ def manual_placement(pdf_path, page_number, x, y, date_point, aspect):
     x0 = min(max(x - width / 2, 2), page_width - width - 2)          # kept 2 pt inside the page
     y0 = min(max(y - height / 2, 2), page_height - height - 2)
     placement = {"page": page_number, "signature": rounded([x0, y0, x0 + width, y0 + height]), "spot_id": None,
-                 "date": None, "manual": True}
+                 "date": None, "date_left_off": None, "manual": True}
     if date_point:
         date_x, date_y = date_point
         placement["date"] = {"fits": True, "kind": "text", "point": [round(date_x, 1), round(date_y, 1)],
-                             "rect": rounded([date_x, date_y - 8, date_x + 130, date_y + 2])}
+                             "rect": rounded([date_x, date_y - 8, date_x + 130, date_y + 2]),
+                             "size": DATE_FONT_SIZES[0]}
     return placement
-
-
-# =============================================================================
-# Sign: stamp the signature and date on a copy, then check the copy
-# =============================================================================
-
-PRINTED_AND_LOCKED = pymupdf.PDF_ANNOT_IS_PRINT | pymupdf.PDF_ANNOT_IS_LOCKED     # flags for the annotations
-
-
-def stamp_signature(page, rect, signature_png, mode, signer_name):
-    """Put the signature image on the page: drawn into the page, or as a stamp annotation (annotation mode)."""
-    rect = pymupdf.Rect(rect)
-    if mode == "annotation":
-        annot = page.add_stamp_annot(rect, stamp=signature_png)
-        annot.set_info(title=signer_name, content="Signature")
-        annot.set_flags(PRINTED_AND_LOCKED)
-        annot.update()
-    else:
-        page.insert_image(rect, stream=signature_png, keep_proportion=True, overlay=True)
-
-
-def write_date(page, date, date_text, mode, signer_name):
-    """Fill in the date: as a form field's value, or as text at its point (an annotation in annotation mode)."""
-    if date["kind"] == "field":
-        for widget in page.widgets():
-            if widget.xref == date["field_xref"]:
-                widget.field_value = date_text
-                widget.update()
-                break
-        return
-    x, baseline = date["point"]
-    if mode == "annotation":
-        width = pymupdf.get_text_length(date_text, fontname="helv", fontsize=DATE_FONT_SIZE)
-        box = pymupdf.Rect(x - 1, baseline - DATE_FONT_SIZE, x + width + 3, baseline + 3)
-        note = page.add_freetext_annot(box, date_text, fontsize=DATE_FONT_SIZE, fontname="helv",
-                                       text_color=(0, 0, 0), border_width=0)
-        note.set_info(content=date_text, title=signer_name)
-        note.set_flags(PRINTED_AND_LOCKED)
-        note.update()
-    else:
-        page.insert_text((x, baseline), date_text, fontsize=DATE_FONT_SIZE, fontname="helv", color=(0, 0, 0))
-
-
-def word_positions(page):
-    """Every word on a page with its position, rounded to whole points."""
-    return [(word[4], round(word[0]), round(word[1])) for word in page.get_text("words")]
-
-
-def page_snapshot(page):
-    """What a page looks like to a reader (words, annotations, form values), for 'nothing else changed'."""
-    annots = [(annot.type[1], [round(value) for value in annot.rect]) for annot in page.annots()]
-    widgets = [(widget.field_name, str(widget.field_value)) for widget in page.widgets()]
-    return json.dumps([word_positions(page), annots, widgets])
-
-
-def same_rect(a, b, tolerance):
-    for value_a, value_b in zip(a, b):
-        if abs(value_a - value_b) > tolerance:
-            return False
-    return True
-
-
-def stamp_landed(page, want, mode):
-    """An image (or, in annotation mode, a stamp annotation) is exactly where the stamp should be."""
-    if mode == "annotation":
-        boxes = [list(annot.rect) for annot in page.annots() if annot.type[1] == "Stamp"]
-    else:
-        boxes = [list(info["bbox"]) for info in page.get_image_info()]
-    for box in boxes:
-        if same_rect(box, want, tolerance=1.5):
-            return True
-    return False
-
-
-def date_check(page, date, date_text, mode):
-    """Did the date land? Returns (title, passed, detail)."""
-    if date["kind"] == "field":
-        values = [widget.field_value for widget in page.widgets() if widget.xref == date["field_xref"]]
-        return "Date filled in the form field", values == [date_text], f"field {date.get('field_name')}"
-    if mode == "annotation":
-        texts = [annot.info.get("content", "") for annot in page.annots() if annot.type[1] == "FreeText"]
-        return "Date added", date_text in texts, date_text
-    zone = pymupdf.Rect(date["rect"]) + (-3, -3, 3, 3)
-    return "Date added", date_text in page.get_text("text", clip=zone), date_text
-
-
-def nothing_else_changed(before, after, placements):
-    """Every original word is still in place, and the pages without a stamp are identical."""
-    stamped = {placement["page"] - 1 for placement in placements}
-    for index in range(before.page_count):
-        if not set(word_positions(before[index])) <= set(word_positions(after[index])):
-            return False
-        if index not in stamped and page_snapshot(before[index]) != page_snapshot(after[index]):
-            return False
-    return True
-
-
-def check_signed_copy(original, signed, placements, mode, date_text):
-    """Checks after stamping: every stamp in place, dates filled, nothing else changed, digital signatures valid."""
-    checks = []
-
-    def add(title, passed, detail=""):
-        checks.append({"title": title, "passed": bool(passed), "detail": detail})
-
-    with pymupdf.open(original) as before, pymupdf.open(signed) as after:
-        add("Same number of pages", before.page_count == after.page_count, f"{before.page_count} -> {after.page_count}")
-        for placement in placements:
-            page = after[placement["page"] - 1]
-            want = placement["signature"]
-            if placement.get("spot_id"):
-                name = f"spot {placement['spot_id']}"
-            else:
-                name = "the place added by hand"
-            add(f"Signature stamp is in place ({name})", stamp_landed(page, want, mode),
-                f"page {placement['page']}, x {want[0]}-{want[2]}, y {want[1]}-{want[3]}")
-            if placement.get("date"):
-                title, passed, detail = date_check(page, placement["date"], date_text, mode)
-                add(f"{title} ({name})", passed, detail)
-        add("Nothing else changed", nothing_else_changed(before, after, placements),
-            "every original word is still in place; other pages are identical")
-    if mode == "annotation":
-        results = validate_signatures(signed)
-        broken = [result["field"] for result in results if not (result["intact"] and result["valid"])]
-        detail = f"{len(results)} signature(s) checked"
-        if broken:
-            detail += f"; broken: {', '.join(broken)}"
-        add("Digital signatures still valid", results and not broken, detail)
-    return checks
-
-
-def stamp_copy(work, rewritten, placements, signature_png, date_text, mode, signer_name):
-    """Stamp every placement on the copy at `work`, in one save (append-only when it can be)."""
-    with pymupdf.open(work) as doc:
-        for placement in placements:
-            page = doc[placement["page"] - 1]
-            stamp_signature(page, placement["signature"], signature_png, mode, signer_name)
-            if placement.get("date"):
-                write_date(page, placement["date"], date_text, mode, signer_name)
-        append_only = doc.can_save_incrementally()
-        if mode == "annotation" and not append_only:
-            raise ValueError("This signed PDF can't be updated append-only, so its digital signatures would break")
-        save_in_full = mode == "content" and not append_only
-        if save_in_full:
-            doc.save(rewritten, garbage=3, deflate=True)
-        else:
-            doc.saveIncr()                         # append-only: the original bytes stay as they were
-    if save_in_full:
-        os.replace(rewritten, work)                # only once the document is closed
-
-
-def sign_pdf(original, out_path, placements, signature_png, date_text, mode, signer_name):
-    """Stamp the signature and date at every placement on a copy. The original is never opened for writing.
-
-    Unsigned PDFs get the image drawn into the page. Digitally signed PDFs get stamp annotations
-    and an append-only save, so their signed bytes stay untouched. The copy is checked before it
-    is kept: it is either fully signed and correct, or not written at all.
-    """
-    out_path = Path(out_path)
-    work = out_path.with_name(out_path.stem + ".work.pdf")          # the copy being stamped
-    rewritten = out_path.with_name(out_path.stem + ".work.full.pdf")  # used when the copy is saved in full
-    shutil.copy2(original, work)
-    try:
-        stamp_copy(work, rewritten, placements, signature_png, date_text, mode, signer_name)
-    except Exception:
-        work.unlink(missing_ok=True)
-        rewritten.unlink(missing_ok=True)
-        raise
-    checks = check_signed_copy(original, work, placements, mode, date_text)
-    ok = all(check["passed"] for check in checks)
-    if ok:
-        os.replace(work, out_path)                 # written under a temporary name, then renamed
-    else:
-        work.unlink(missing_ok=True)
-    return {"ok": ok, "checks": checks}

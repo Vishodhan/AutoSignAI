@@ -12,7 +12,7 @@
 <header>
   <div class="bar">
     <a class="brand" href="/">AutoSign <small>client agreements, signed on every file</small></a>
-    <nav><a href="/">Upload another agreement</a><a href="/verify">Check a signed copy</a></nav>
+    <nav><a href="/dashboard">Dashboard</a><a href="/">Upload another agreement</a><a href="/verify">Check a signed copy</a></nav>
   </div>
 </header>
 
@@ -24,39 +24,56 @@
     </div>
     <p class="muted small" id="subtitle"></p>
     <div id="status-banner"></div>
+    <div class="signer spaced" id="signer-card"></div>
     <div id="company-banner" class="spaced"></div>
     <ul class="muted small notes" id="notes"></ul>
-    <p class="muted small spaced">Bookmark this page: it is the only way back to this agreement and its client files.
-      Anyone with this link can see them.</p>
   </section>
 
   <section class="card">
-    <h2>Client files</h2>
-    <p class="muted small">A client file is one case for one client. Each one gets its own signing link, and its own signed copy.</p>
+    <h2>Send it to a client</h2>
+    <p class="muted small">A client file is one case for one client. DocuSeal signs the client's copy for your company,
+      with today's date, and you check it before DocuSeal emails the client.</p>
     <div class="stats" id="stats"></div>
     <form class="new-file" id="new-file">
       <label class="field">Client's name
         <input type="text" id="client-name" required minlength="2" maxlength="120" placeholder="e.g. Foo Holdings LLC">
       </label>
+      <label class="field">Client's email
+        <input type="email" id="client-email" required maxlength="200" placeholder="e.g. jordan@foo.example">
+      </label>
       <label class="field">Your file reference (optional)
         <input type="text" id="reference" maxlength="80" placeholder="e.g. 2026-014">
       </label>
-      <button class="btn primary" type="submit" id="create-file">Create signing link</button>
+      <button class="btn primary" type="submit" id="create-file">Prepare the client's copy</button>
     </form>
-    <p class="banner warn small" id="not-ready" hidden>Confirm the signature places below before creating signing links.</p>
-    <div class="table-wrap">
+    <p class="banner warn small" id="not-ready" hidden>Confirm the signature places below before sending the agreement to a client.</p>
+    <p class="banner warn small" id="no-docuseal" hidden>DocuSeal isn't set up on this server (no DOCUSEAL_API_KEY), so nothing can be sent yet.</p>
+    <p class="muted small" id="preparing" hidden>DocuSeal is preparing the client's copy with your company's signature. This takes a few seconds.</p>
+
+    <div class="preview spaced" id="preview" hidden>
+      <h2 id="preview-title">Check your company's signature</h2>
+      <p class="small" id="preview-help"></p>
+      <div class="pages" id="preview-pages"></div>
+      <div class="row spaced">
+        <button class="btn primary" type="button" id="send">Signatures look right: email the client</button>
+        <button class="btn" type="button" id="cancel-preview">Something's wrong: don't send</button>
+        <a class="btn small" id="preview-pdf" href="#" target="_blank" rel="noopener">Open the whole PDF</a>
+      </div>
+    </div>
+
+    <div class="table-wrap spaced">
       <table>
         <thead>
-          <tr><th>Client</th><th>Reference</th><th>Link created</th><th>Opened</th><th>Signed</th><th>Status</th><th></th></tr>
+          <tr><th>Client</th><th>Email</th><th>Status</th><th>Email sent</th><th>Opened</th><th>Signed</th><th></th></tr>
         </thead>
         <tbody id="files"></tbody>
       </table>
     </div>
-    <p class="empty" id="no-files">No client files yet. Create the first one above.</p>
+    <p class="empty" id="no-files">No client files yet. Add the first client above.</p>
     <div class="row spaced">
       <a class="btn small" id="audit-link" href="#">Download the audit log (CSV)</a>
       <button class="btn small" type="button" id="refresh">Refresh</button>
-      <span class="muted small">This list refreshes by itself every 20 seconds.</span>
+      <span class="muted small">This list checks with DocuSeal every 20 seconds.</span>
     </div>
   </section>
 
@@ -142,10 +159,6 @@ function pageSize(number) {
   return view.pages.find((page) => page.number === number);
 }
 
-function hasPlaces(places) {
-  return places.spots.length > 0 || places.manual.length > 0;
-}
-
 // ---------------------------------------------------------------------------
 // The top card: what the agreement is and whether it is ready
 // ---------------------------------------------------------------------------
@@ -170,17 +183,18 @@ function renderStatus() {
       Check the places below, then press <b>Confirm these places</b>.<ul>${reasons}</ul></div>`;
   }
 
+  const signerParts = [view.signer_name, view.signer_title].filter(Boolean).join(", ");
+  document.getElementById("signer-card").innerHTML = `
+    <img src="${esc(view.signature_url)}" alt="${esc(view.firm_name)}'s signature: ${esc(view.signer_name || "")} in cursive">
+    <div class="small">
+      <b>${esc(view.firm_name)}</b> signs as ${esc(signerParts || view.firm_name)}.<br>
+      <span class="muted">DocuSeal sends the signed copies to ${esc(view.company_email || "your company")}.</span>
+    </div>`;
+
   const company = view.company;
   const companyBanner = document.getElementById("company-banner");
-  if (company.signed_at) {
-    const signer = company.signer || view.firm_name;
-    companyBanner.innerHTML = `<div class="banner good">Signed for ${esc(view.firm_name)} by ${esc(signer)}
-      (date written: ${esc(company.date)}). Every client signs this pre-signed copy.</div>`;
-  } else if (company.note) {
+  if (company.note) {
     companyBanner.innerHTML = `<div class="banner warn">${esc(company.note)}</div>`;
-  } else if (hasPlaces(company)) {
-    companyBanner.innerHTML = `<div class="banner warn">AutoSign will sign for ${esc(view.firm_name)}
-      once you confirm the places.</div>`;
   } else {
     companyBanner.innerHTML = "";
   }
@@ -188,49 +202,67 @@ function renderStatus() {
   document.getElementById("notes").innerHTML = view.notes.map((note) => `<li>${esc(note)}</li>`).join("");
 }
 
+const FILE_STATUS = {
+  preview: ["Waiting for your check", "warn"],
+  sent: ["Email sent", ""],
+  opened: ["Opened, not signed", "warn"],
+  viewed: ["Opened, not signed", "warn"],
+  signed: ["Signed", "good"],
+  declined: ["Declined", "bad"],
+  cancelled: ["Not sent", ""],
+};
+
+function fileStatusChip(status) {
+  const known = FILE_STATUS[status] || [status, ""];
+  return `<span class="chip ${known[1]}">${esc(known[0])}</span>`;
+}
+
 // ---------------------------------------------------------------------------
 // The client files dashboard
 // ---------------------------------------------------------------------------
 
 function renderStats() {
-  let signed = 0;
-  let opened = 0;
+  const counts = { preview: 0, sent: 0, opened: 0, signed: 0 };
   for (const file of view.files) {
-    if (file.status === "signed") {
-      signed += 1;
-    } else if (file.status === "viewed") {
-      opened += 1;
+    if (file.status in counts) {
+      counts[file.status] += 1;
     }
   }
-  const total = view.files.length;
   const boxes = [
-    [total, "client files"],
-    [signed, "signed"],
-    [opened, "opened, not signed"],
-    [total - signed - opened, "not opened yet"],
+    [counts.sent + counts.opened + counts.signed, "emailed to clients"],
+    [counts.signed, "signed"],
+    [counts.opened, "opened, not signed"],
+    [counts.preview, "waiting for your check"],
   ];
   document.getElementById("stats").innerHTML = boxes
     .map(([count, label]) => `<div class="stat"><b>${count}</b><span>${label}</span></div>`)
     .join("");
 }
 
-function fileRow(file) {
+function fileRow(file, index) {
   let signedText = "";
   if (file.signed_at) {
     signedText = `${esc(localTime(file.signed_at))}<br><span class="muted small">by ${esc(file.signer_name)}</span>`;
   }
-  let actions = `<button class="btn small" type="button" data-copy="${esc(file.sign_url)}">Copy link</button>`;
+  let actions = "";
+  if (file.status === "preview") {
+    actions = `<button class="btn small" type="button" data-review="${index}">Check and send</button>`;
+  }
   if (file.signed_pdf_url) {
     actions += `<a class="btn small" href="${esc(file.signed_pdf_url)}" target="_blank" rel="noopener">View PDF</a>`;
     actions += `<a class="btn small" href="${esc(file.signed_pdf_url)}?download=1">Download</a>`;
   }
+  let reference = "";
+  if (file.reference) {
+    reference = `<br><span class="muted small">ref. ${esc(file.reference)}</span>`;
+  }
   return `<tr>
-    <td>${esc(file.client_name)}</td>
-    <td>${esc(file.reference)}</td>
-    <td>${esc(localTime(file.created_at))}</td>
+    <td>${esc(file.client_name)}${reference}</td>
+    <td>${esc(file.client_email)}</td>
+    <td>${fileStatusChip(file.status)}</td>
+    <td>${esc(localTime(file.email_sent_at))}</td>
     <td>${esc(localTime(file.viewed_at))}</td>
     <td>${signedText}</td>
-    <td>${statusChip(file.status)}</td>
     <td class="actions">${actions}</td>
   </tr>`;
 }
@@ -238,17 +270,46 @@ function fileRow(file) {
 function renderFiles() {
   renderStats();
   const ready = view.status === "ready";
-  document.getElementById("create-file").disabled = !ready;
+  document.getElementById("create-file").disabled = !ready || !view.docuseal_ready;
   document.getElementById("not-ready").hidden = ready;
+  document.getElementById("no-docuseal").hidden = view.docuseal_ready;
   document.getElementById("files").innerHTML = view.files.map(fileRow).join("");
   document.getElementById("no-files").hidden = view.files.length > 0;
   document.getElementById("audit-link").href = `${apiBase}/audit.csv`;
 }
 
+// ---------------------------------------------------------------------------
+// Checking a client's copy before DocuSeal emails it
+// ---------------------------------------------------------------------------
+
+let previewFile = null;     // the client file being checked
+
+function showPreview(file) {
+  previewFile = file;
+  const panel = document.getElementById("preview");
+  panel.hidden = false;
+  document.getElementById("preview-title").textContent = `Check your company's signature on ${file.client_name}'s copy`;
+  document.getElementById("preview-help").textContent =
+    `This is the copy DocuSeal will send. Your company's signature and today's date (${file.company_date || ""}) ` +
+    `are on it; the client's places are still empty. If it looks right, DocuSeal emails ${file.client_email} ` +
+    "to sign it.";
+  document.getElementById("preview-pages").innerHTML = file.preview_pages
+    .map((page) => `<img loading="lazy" src="${esc(page.url)}" alt="Page ${page.number} of the client's copy">`)
+    .join("");
+  document.getElementById("preview-pdf").href = file.preview_pdf_url;
+  document.getElementById("send").textContent = `Signatures look right: email ${file.client_email}`;
+  panel.scrollIntoView({ behavior: "smooth", block: "start" });
+}
+
+function hidePreview() {
+  previewFile = null;
+  document.getElementById("preview").hidden = true;
+}
+
 document.getElementById("files").addEventListener("click", (event) => {
-  const button = event.target.closest("[data-copy]");
+  const button = event.target.closest("[data-review]");
   if (button) {
-    copyText(fullUrl(button.dataset.copy), button);
+    showPreview(view.files[Number(button.dataset.review)]);
   }
 });
 
@@ -256,14 +317,51 @@ document.getElementById("new-file").addEventListener("submit", (event) => {
   event.preventDefault();
   run(async () => {
     const nameInput = document.getElementById("client-name");
+    const emailInput = document.getElementById("client-email");
     const referenceInput = document.getElementById("reference");
-    const file = await sendJSON(`${apiBase}/files`, {
-      client_name: nameInput.value,
-      reference: referenceInput.value,
-    });
-    nameInput.value = "";
-    referenceInput.value = "";
-    await copyText(fullUrl(file.sign_url));
+    const button = document.getElementById("create-file");
+    const preparing = document.getElementById("preparing");
+    button.disabled = true;
+    preparing.hidden = false;
+    try {
+      const file = await sendJSON(`${apiBase}/files`, {
+        client_name: nameInput.value,
+        client_email: emailInput.value,
+        reference: referenceInput.value,
+        tz_offset_minutes: -new Date().getTimezoneOffset(),
+      });
+      nameInput.value = "";
+      emailInput.value = "";
+      referenceInput.value = "";
+      await refresh();
+      showPreview(file);
+    } finally {
+      preparing.hidden = true;
+      renderFiles();
+    }
+  });
+});
+
+document.getElementById("send").addEventListener("click", () => {
+  run(async () => {
+    const button = document.getElementById("send");
+    button.disabled = true;
+    try {
+      const file = await sendJSON(previewFile.send_url, {});
+      hidePreview();
+      toast(`DocuSeal emailed ${file.client_email} to sign.`);
+      await refresh();
+    } finally {
+      button.disabled = false;
+    }
+  });
+});
+
+document.getElementById("cancel-preview").addEventListener("click", () => {
+  run(async () => {
+    await sendJSON(previewFile.cancel_url, {});
+    hidePreview();
+    toast("Not sent. Check the signature places below, then prepare the client's copy again.");
     await refresh();
   });
 });
@@ -325,11 +423,12 @@ function renderSpots() {
   const help = document.getElementById("confirm-help");
   if (view.status === "ready") {
     button.textContent = "Save changes";
-    help.textContent = "The places are confirmed. If you change them, AutoSign signs for your company again. " +
-      "Copies that clients already signed stay as they are.";
+    help.textContent = "The places are confirmed. Changes apply to the next client copies you prepare; " +
+      "copies already sent stay as they are.";
   } else {
     button.textContent = "Confirm these places";
-    help.textContent = "AutoSign then signs for your company (where you chose its place), and you can create signing links.";
+    help.textContent = "Then you can send the agreement to clients: DocuSeal signs each client's copy for your " +
+      "company where you chose its place.";
   }
 }
 
@@ -550,7 +649,7 @@ document.getElementById("confirm").addEventListener("click", () => {
       imageVersion = Date.now();
       resetDraft();
       renderAll();
-      toast("Places confirmed. You can create signing links now.");
+      toast("Places confirmed. You can send the agreement to clients now.");
     } finally {
       button.disabled = false;
     }

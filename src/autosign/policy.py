@@ -5,7 +5,7 @@ Change a value here to tune the rules; the tests in tests/ show what each one do
 Distances are PDF points (72 pt = 1 inch).
 """
 
-RULES_VERSION = "rules_v1"
+RULES_VERSION = "rules_v2"
 PROMPT_VERSION = "client_judge_v2"      # v2: the AI also lists the company's own signature spots
 
 
@@ -18,7 +18,8 @@ MIN_LINE_WIDTH = 45          # Shorter rules are not signature or date lines.
 # heights to fit along a 2-inch line: a 7:1 signature at 20 pt is 140 pt long.
 SIGNATURE_HEIGHTS = [32, 29, 26, 23, 20, 18]
 DROP_RATIOS = [0.15, 0.08, 0.0]    # Share of the stamp height that may sit below the line.
-DATE_FONT_SIZE = 10
+# Date text sizes to try, largest first, when the date is tight. Never smaller than 9 pt, so it stays readable.
+DATE_FONT_SIZES = [10, 9]
 ROW_TOLERANCE = 3.5          # Words whose bottoms are this close share a row.
 SEGMENT_GAP = 12             # A wider gap splits a row into separate labels.
 HEADER_REACH = 70            # How far above a spot to look for its header ("PARTY A").
@@ -36,6 +37,10 @@ SIGN_WORDS = {"signature", "signed", "sign", "signatory", "signer"}
 NEVER_WORDS = {"witness", "witnessed", "notary", "notarial", "guarantor", "surety",
                "attest", "attested", "attestation"}
 # Words that show a "signature" label is not a place to sign.
+# The words of a label for the signer's printed name: "Name:", "Print Name", "Printed name", "Name of
+# signatory". A label with any other word ("Company Name", "Client Name") asks for something else.
+NAME_LABEL_WORDS = {"name", "print", "printed", "full", "type", "typed", "signatory", "signer", "authorized",
+                    "authorised", "of", "or", "please", "legal"}
 NOT_A_SPOT_WORDS = {"page", "pages", "follows", "follow", "initial", "initials", "initialed",
                     "electronic", "electronically", "esign", "counterpart", "counterparts",
                     "whereof", "block", "blocks"}
@@ -62,16 +67,13 @@ KNOWN_ROLES = ["service provider", "provider", "client", "customer", "company", 
                "contractor", "independent contractor", "vendor", "supplier", "disclosing party",
                "receiving party", "discloser", "recipient", "party a", "party b", "party 1",
                "party 2", "first party", "second party", "employer", "employee", "licensor",
-               "licensee", "buyer", "seller", "purchaser", "member", "manager", "landlord",
-               "tenant", "lessor", "lessee", "agency", "agent", "partner", "owner", "lender",
-               "borrower", "subcontractor", "investor", "distributor", "reseller", "sponsor",
-               "principal"]
+               "licensee", "buyer", "seller", "purchaser", "member", "lessor", "lessee",
+                "agency", "agent", "partner", "owner"]
 
 # Roles a client usually has in the agreement a company sends it. A block that names one of these
 # is the client's (unless the contract gives that role to the sending company).
-CLIENT_ROLES = ["Client", "Customer", "Patient", "Member", "Participant", "Buyer", "Purchaser", "Tenant",
-                "Lessee", "Borrower", "Licensee", "Policyholder", "Insured", "Claimant", "Applicant",
-                "Student", "Subscriber", "Homeowner"]
+CLIENT_ROLES = ["Client", "Customer",  "Member", "Participant", "Buyer", "Purchaser",
+                "Licensee",  "Insured", "Applicant",  "Subscriber"]
 
 # Document types: the earliest match on page 1 wins (the title comes first).
 DOC_TYPE_PATTERNS = [
@@ -82,7 +84,6 @@ DOC_TYPE_PATTERNS = [
     ("service_agreement", r"services?\s+(agreement|contract)|consult\w*\s+agreement|professional\s+services"),
     ("employment", r"employment\s+(agreement|contract)"),
     ("operating_agreement", r"operating\s+agreement"),
-    ("lease", r"\blease\b|rental\s+agreement"),
 ]
 DOC_TYPES = ["nda", "mutual_nda", "service_agreement", "msa", "sow", "employment",
              "operating_agreement", "lease", "other"]
@@ -119,7 +120,11 @@ EXECUTION_PATTERNS = [
 # =============================================================================
 
 DATE_FORMAT = "%b %d, %Y"         # zero-padded day, so every date has the same length
-SIGNATURE_ASPECT = 3.5            # width / height of every stamped signature (each image is padded to it)
-MAX_PAGES = 100                   # bigger agreements are refused
+DOCUSEAL_DATE_FORMAT = "MMM DD, YYYY"   # the same format, as DocuSeal writes the client's date
+SIGNATURE_ASPECT = 3.5            # width / height of every signature place
+# The company's signature: the signer's name in cursive, drawn at 4 pixels per point of the largest
+# signature place (288 dpi), so it prints sharply but is never larger than its place.
+SIGNATURE_PIXELS_PER_POINT = 4
+SIGNATURE_INK = (20, 40, 120)     # dark blue, like a pen
+MAX_PAGES = 50                   # bigger agreements are refused
 MAX_MB = 25
-MAX_SIGNATURE_BYTES = 2_000_000   # the signature image sent by the browser

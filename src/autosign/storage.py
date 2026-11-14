@@ -3,18 +3,20 @@ Where AutoSign keeps things.
 
     storage/autosign.db      SQLite: the agreements and the client files (their state, not their history)
     storage/audit-log.csv    the audit log: one row per event, hash-chained, append-only
-    storage/agreements/      every uploaded agreement (<id>.pdf), and the copy your company has
-                             already signed (<id>.presigned.pdf), which is what each client signs
-    storage/signed/          every copy signed by a client
-    data/signature.png       your company's signature image, kept with the code
+    storage/agreements/      every uploaded agreement (<id>.pdf), and the company's cursive
+                             signature made from the signer's name (<id>.signature.png)
+    storage/previews/        each client file's copy as DocuSeal prepared it, with the company's
+                             signature on it, for the company to check before it is sent
+    storage/signed/          each client file's signed copy, downloaded from DocuSeal
+    data/fonts/              the cursive font of the company's signature, kept with the code
 
 AutoSign runs from the project folder (locally the repository, on Railway /app), and finds .env,
 data/ and storage/ there. AUTOSIGN_HOME moves storage/ elsewhere (on Railway: the volume, /data);
-COMPANY_SIGNATURE_FILE points at another signature image.
+SIGNATURE_FONT_FILE points at another cursive font.
 
 An agreement row holds, as JSON: the analysis (pipeline.analyze), the AI's opinion, the client's
-places ('proposal') and their stamp positions ('placements'), and 'company': the company's
-places, stamp positions and signing record (signer, signed_at, date, sha256, note).
+places ('proposal') and their positions ('placements'), and 'company': the company's places and
+their positions. A client file row holds the DocuSeal submission it was sent as.
 """
 
 import csv
@@ -31,11 +33,12 @@ from pathlib import Path
 HOME = Path(os.environ.get("AUTOSIGN_HOME") or ".").resolve()
 STORAGE = HOME / "storage"
 AGREEMENTS = STORAGE / "agreements"
+PREVIEWS = STORAGE / "previews"
 SIGNED = STORAGE / "signed"
 DB_FILE = STORAGE / "autosign.db"
 AUDIT_FILE = STORAGE / "audit-log.csv"
 STATIC = Path(__file__).resolve().parent / "static"
-COMPANY_SIGNATURE = Path(os.environ.get("COMPANY_SIGNATURE_FILE") or "data/signature.png").resolve()
+SIGNATURE_FONT = Path(os.environ.get("SIGNATURE_FONT_FILE") or "data/fonts/GreatVibes-Regular.ttf").resolve()
 
 LOCK = threading.RLock()        # one writer at a time for the audit chain and the database
 
@@ -57,14 +60,16 @@ def fingerprint(data):
 # The database: agreements and client files
 # =============================================================================
 
-AGREEMENT_COLUMNS = ["token", "filename", "firm_name", "created_at", "sha256", "analysis", "ai", "proposal",
-                     "placements", "reasons", "summary", "status", "company"]
-FILE_COLUMNS = ["agreement_id", "manage_token", "sign_token", "client_name", "reference", "status", "created_at",
-                "viewed_at", "signed_at", "signer_name", "signer_ip", "signer_agent", "signed_sha256",
-                "certificate", "placements"]
+AGREEMENT_COLUMNS = ["token", "filename", "firm_name", "signer_name", "signer_title", "company_email", "created_at",
+                     "sha256", "analysis", "ai", "proposal", "placements", "reasons", "summary", "status", "company"]
+# A client file's status: preview (prepared in DocuSeal, waiting for the company's check), sent,
+# opened, signed, declined, or cancelled (the company didn't send it).
+FILE_COLUMNS = ["agreement_id", "manage_token", "client_name", "client_email", "reference", "status", "created_at",
+                "submission_id", "client_submitter_id", "company_date", "email_sent_at", "viewed_at", "signed_at",
+                "signer_name", "signed_sha256", "checked_at"]
 JSON_COLUMNS = {"analysis", "ai", "proposal", "placements", "reasons", "company"}
-UNIQUE_COLUMNS = {"token", "manage_token", "sign_token"}
-FILE_LOOKUPS = {"id", "manage_token", "sign_token", "signed_sha256"}
+UNIQUE_COLUMNS = {"token", "manage_token"}
+FILE_LOOKUPS = {"id", "manage_token", "signed_sha256"}
 
 
 def connect():
@@ -133,8 +138,8 @@ def create_table(con, table, columns):
 
 
 def init():
-    """Create the folders and tables, and remove half-finished copies a crash may have left."""
-    for folder in (AGREEMENTS, SIGNED):
+    """Create the folders and tables."""
+    for folder in (AGREEMENTS, PREVIEWS, SIGNED):
         folder.mkdir(parents=True, exist_ok=True)
     con = connect()
     try:
@@ -144,9 +149,6 @@ def init():
         con.commit()
     finally:
         con.close()
-    for folder in (AGREEMENTS, SIGNED):
-        for leftover in folder.glob("*.work*.pdf"):
-            leftover.unlink(missing_ok=True)
 
 
 def check_columns(table, columns, fields):
@@ -190,28 +192,22 @@ def agreement_by_id(agreement_id):
     return first("SELECT * FROM agreements WHERE id = ?", (agreement_id,))
 
 
+def all_agreements():
+    return query("SELECT * FROM agreements ORDER BY id DESC")
+
+
 def agreement_pdf(agreement):
-    """The agreement exactly as the company uploaded it."""
+    """The agreement exactly as the company uploaded it. This is what DocuSeal gets for each client."""
     return AGREEMENTS / f"{agreement['id']}.pdf"
 
 
-def presigned_pdf(agreement):
-    """The agreement with the company's signature already on it."""
-    return AGREEMENTS / f"{agreement['id']}.presigned.pdf"
+def signature_png(agreement):
+    """The company's signature for this agreement: the signer's name in cursive."""
+    return AGREEMENTS / f"{agreement['id']}.signature.png"
 
 
-def pdf_for_client(agreement):
-    """What each client signs: the copy the company signed, or the original when the company doesn't sign."""
-    company = agreement["company"] or {}
-    presigned = presigned_pdf(agreement)
-    if company.get("signed_at") and presigned.exists():
-        return presigned
-    return agreement_pdf(agreement)
-
-
-def create_file(agreement_id, client_name, reference):
-    fields = {"agreement_id": agreement_id, "client_name": client_name, "reference": reference, "status": "sent",
-              "created_at": now_text(), "manage_token": new_token(), "sign_token": new_token()}
+def create_file(**fields):
+    fields = dict(fields, created_at=now_text())
     return insert("files", FILE_COLUMNS, fields)
 
 
@@ -227,6 +223,15 @@ def file_by(column, value):
 
 def files_for(agreement_id):
     return query("SELECT * FROM files WHERE agreement_id = ? ORDER BY id DESC", (agreement_id,))
+
+
+def all_files():
+    return query("SELECT * FROM files ORDER BY id DESC")
+
+
+def preview_pdf(file):
+    """The copy DocuSeal prepared for this client file, with the company's signature on it."""
+    return PREVIEWS / f"{file['id']}.pdf"
 
 
 def signed_pdf(file):

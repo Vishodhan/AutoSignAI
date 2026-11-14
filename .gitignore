@@ -18,9 +18,12 @@ inbox/
 settings.json
 
 # Sample contracts: several are licensed for internal testing only (see data/new_samples/SOURCES.md).
-# The tests skip the ones that are missing. (data/signature.png, the company's signature, is committed.)
+# The tests skip the ones that are missing.
 data/*.pdf
 data/new_samples/*.pdf
 
 # Earlier design notes for the first (local, company-side) version; kept out of the public repo.
 docs/AutoSignPDF_System_Design.html
+
+# The comparison of the rules, Gemini alone and both (local research; its sample pages are licensed).
+compare/

@@ -237,6 +237,8 @@ def clean_client_picks(raw_picks, spot_ids, date_ids):
     picks = []
     seen = set()
     for pick in raw_picks or []:
+        if not isinstance(pick, dict):
+            raise OutsideTheList(f"a pick that isn't an object: {pick!r}")
         spot_id = pick.get("signature_spot")
         date_id = pick.get("date_spot")
         if spot_id not in spot_ids or date_id not in date_ids:
@@ -253,6 +255,8 @@ def clean_company_picks(raw_picks, spot_ids):
     picks = []
     seen = set()
     for pick in raw_picks or []:
+        if not isinstance(pick, dict):
+            raise OutsideTheList(f"a pick that isn't an object: {pick!r}")
         spot_id = pick.get("signature_spot")
         if spot_id not in spot_ids:
             raise OutsideTheList(f"signature spot {spot_id}")
@@ -285,6 +289,8 @@ def ask_ai(pdf_path, analysis, firm_name):
     except Exception as error:
         return dict(record, ok=False, error=f"{type(error).__name__}: {error}", seconds=seconds_since(started))
 
+    if not isinstance(answer, dict):
+        return dict(record, ok=False, error="The AI's answer wasn't a JSON object", seconds=seconds_since(started))
     try:
         client_picks = clean_client_picks(answer.get("picks"), spot_ids, date_ids)
         company_picks = clean_company_picks(answer.get("company_picks"), spot_ids)

@@ -1,0 +1,169 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<meta name="robots" content="noindex, nofollow">
+<title>Dashboard: AutoSign</title>
+<link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+<header>
+  <div class="bar">
+    <a class="brand" href="/">AutoSign <small>client agreements, signed on every file</small></a>
+    <nav><a href="/">Upload an agreement</a><a href="/verify">Check a signed copy</a></nav>
+  </div>
+</header>
+
+<main>
+  <section class="card">
+    <h1>Dashboard</h1>
+    <p class="muted small">Every client your agreements were emailed to: which document, to which address, and when
+      DocuSeal sent the email. Statuses are checked with DocuSeal every 20 seconds.</p>
+    <p class="banner warn small" id="no-docuseal" hidden>DocuSeal isn't set up on this server (no DOCUSEAL_API_KEY), so statuses can't be checked.</p>
+    <div class="stats" id="stats"></div>
+  </section>
+
+  <section class="card">
+    <h2>Emails sent to clients</h2>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>Document</th><th>Client</th><th>Email sent to</th><th>Email sent</th><th>Status</th><th>Signed</th><th></th></tr>
+        </thead>
+        <tbody id="files"></tbody>
+      </table>
+    </div>
+    <p class="empty" id="no-files">No emails sent yet. Open an agreement below and send it to a client.</p>
+  </section>
+
+  <section class="card">
+    <h2>Your agreements</h2>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>Document</th><th>Signs for the company</th><th>Uploaded</th><th>Status</th><th>Emailed</th><th>Signed</th><th></th></tr>
+        </thead>
+        <tbody id="agreements"></tbody>
+      </table>
+    </div>
+    <p class="empty" id="no-agreements">No agreements yet. <a href="/">Upload the first one.</a></p>
+    <div class="row spaced">
+      <button class="btn small" type="button" id="refresh">Refresh</button>
+    </div>
+  </section>
+</main>
+
+<footer>AutoSign. Test data only: don't upload real people's personal information.</footer>
+
+<script src="/static/common.js"></script>
+<script>
+"use strict";
+
+const REFRESH_SECONDS = 20;
+const FILE_STATUS = {
+  preview: ["Waiting for your check", "warn"],
+  sent: ["Email sent", ""],
+  opened: ["Opened, not signed", "warn"],
+  viewed: ["Opened, not signed", "warn"],
+  signed: ["Signed", "good"],
+  declined: ["Declined", "bad"],
+  cancelled: ["Not sent", ""],
+};
+
+// "2026-11-12 03:53:14 UTC" from the server, shown in the reader's own time.
+function localTime(text) {
+  if (!text) {
+    return "";
+  }
+  const date = new Date(text.replace(" UTC", "Z").replace(" ", "T"));
+  if (isNaN(date)) {
+    return text;
+  }
+  return date.toLocaleString([], { dateStyle: "medium", timeStyle: "short" });
+}
+
+function fileStatusChip(status) {
+  const known = FILE_STATUS[status] || [status, ""];
+  return `<span class="chip ${known[1]}">${esc(known[0])}</span>`;
+}
+
+function renderStats(files) {
+  const counts = { preview: 0, sent: 0, opened: 0, signed: 0 };
+  for (const file of files) {
+    if (file.status in counts) {
+      counts[file.status] += 1;
+    }
+  }
+  const boxes = [
+    [counts.sent + counts.opened + counts.signed, "emails sent"],
+    [counts.signed, "signed"],
+    [counts.opened, "opened, not signed"],
+    [counts.preview, "waiting for your check"],
+  ];
+  document.getElementById("stats").innerHTML = boxes
+    .map(([count, label]) => `<div class="stat"><b>${count}</b><span>${label}</span></div>`)
+    .join("");
+}
+
+function fileRow(file) {
+  let signedText = "";
+  if (file.signed_at) {
+    signedText = `${esc(localTime(file.signed_at))}<br><span class="muted small">by ${esc(file.signer_name)}</span>`;
+  }
+  let actions = `<a class="btn small" href="${esc(file.agreement_url)}">Open agreement</a>`;
+  if (file.signed_pdf_url) {
+    actions += `<a class="btn small" href="${esc(file.signed_pdf_url)}" target="_blank" rel="noopener">Signed PDF</a>`;
+  }
+  return `<tr>
+    <td>${esc(file.document)}</td>
+    <td>${esc(file.client_name)}</td>
+    <td>${esc(file.client_email)}</td>
+    <td>${esc(localTime(file.email_sent_at))}</td>
+    <td>${fileStatusChip(file.status)}</td>
+    <td>${signedText}</td>
+    <td class="actions">${actions}</td>
+  </tr>`;
+}
+
+function agreementRow(agreement) {
+  const ready = agreement.status === "ready"
+    ? '<span class="chip good">Ready to send</span>'
+    : '<span class="chip warn">Check the places</span>';
+  const signer = [agreement.signer_name, agreement.signer_title].filter(Boolean).join(", ");
+  return `<tr>
+    <td>${esc(agreement.filename)}</td>
+    <td>${esc(signer)}<br><span class="muted small">${esc(agreement.firm_name)}</span></td>
+    <td>${esc(localTime(agreement.created_at))}</td>
+    <td>${ready}</td>
+    <td>${agreement.emails_sent}</td>
+    <td>${agreement.signed}</td>
+    <td class="actions"><a class="btn small" href="${esc(agreement.url)}">Open</a></td>
+  </tr>`;
+}
+
+async function refresh() {
+  const view = await api("/api/dashboard");
+  const sent = view.files.filter((file) => file.status !== "cancelled");
+  renderStats(sent);
+  document.getElementById("no-docuseal").hidden = view.docuseal_ready;
+  document.getElementById("files").innerHTML = sent.map(fileRow).join("");
+  document.getElementById("no-files").hidden = sent.length > 0;
+  document.getElementById("agreements").innerHTML = view.agreements.map(agreementRow).join("");
+  document.getElementById("no-agreements").hidden = view.agreements.length > 0;
+}
+
+document.getElementById("refresh").addEventListener("click", () => run(refresh));
+
+run(async () => {
+  await refresh();
+  setInterval(() => {
+    if (!document.hidden) {
+      refresh().catch(() => {});
+    }
+  }, REFRESH_SECONDS * 1000);
+});
+</script>
+</body>
+</html>

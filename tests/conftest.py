@@ -1,12 +1,12 @@
 """
-Test setup: a throwaway data folder for the app, a test company signature, and the shared fixtures.
+Test setup: a throwaway data folder for the app, a test signature image, and the shared fixtures.
 
-pytest loads this file before any test, so the app's storage (AUTOSIGN_HOME) and the company's
-signature image (COMPANY_SIGNATURE_FILE) point at a temporary folder before any autosign module is
-imported. Your real storage/ and data/signature.png are never touched by the tests.
+pytest loads this file before any test, so the app's storage (AUTOSIGN_HOME) points at a temporary
+folder before any autosign module is imported. Your real storage/ is never touched by the tests.
 
-Only the tests marked `live` may call Gemini (uv run pytest -m live -s). Every other test runs as if
-no GEMINI_API_KEY were set, or with the stand-in AI from the `fake_ai` fixture.
+Only the tests marked `live` may call Gemini or DocuSeal (uv run pytest -m live -s). Every other test
+runs as if neither key were set, or with the stand-ins of the `fake_ai` and `fake_docuseal` fixtures;
+a test that would reach the real DocuSeal fails instead.
 """
 
 import os
@@ -17,12 +17,15 @@ import pytest
 
 TEST_HOME = Path(tempfile.mkdtemp(prefix="autosign-test-"))
 os.environ["AUTOSIGN_HOME"] = str(TEST_HOME)
-os.environ["COMPANY_SIGNATURE_FILE"] = str(TEST_HOME / "data" / "signature.png")
 
-from autosign import ai, app, storage               # noqa: E402  (must come after AUTOSIGN_HOME is set)
-from helpers import agreeing_ai, make_test_signature    # noqa: E402
+from autosign import ai, app, docuseal              # noqa: E402  (must come after AUTOSIGN_HOME is set)
+from helpers import TEST_SIGNATURE, FakeDocuSeal, agreeing_ai, make_test_signature    # noqa: E402
 
-make_test_signature(storage.COMPANY_SIGNATURE)
+make_test_signature(TEST_SIGNATURE)
+
+
+def no_network(*args, **kwargs):
+    raise AssertionError("A test tried to reach the real DocuSeal")
 
 
 @pytest.fixture(scope="session")
@@ -34,13 +37,27 @@ def client():
 
 
 @pytest.fixture(autouse=True)
-def no_real_ai(request, monkeypatch):
-    """Outside the live tests, the app behaves as if the AI isn't set up."""
-    if "live" not in request.keywords:
-        monkeypatch.setattr(ai, "available", lambda: False)
+def no_real_services(request, monkeypatch):
+    """Outside the live tests, the app behaves as if neither the AI nor DocuSeal is set up."""
+    if "live" in request.keywords:
+        return
+    monkeypatch.setattr(ai, "available", lambda: False)
+    monkeypatch.setattr(docuseal, "available", lambda: False)
+    monkeypatch.setattr(docuseal, "call", no_network)
+    monkeypatch.setattr(docuseal, "download", no_network)
 
 
 @pytest.fixture
 def fake_ai(monkeypatch):
     """Replace the AI with a stand-in that agrees with the rules (where the real model isn't the point)."""
     monkeypatch.setattr(ai, "ask_ai", agreeing_ai)
+
+
+@pytest.fixture
+def fake_docuseal(monkeypatch):
+    """Replace DocuSeal's API with an in-memory stand-in. Returns it, so a test can play the client."""
+    fake = FakeDocuSeal()
+    monkeypatch.setattr(docuseal, "available", lambda: True)
+    monkeypatch.setattr(docuseal, "call", fake.call)
+    monkeypatch.setattr(docuseal, "download", fake.download)
+    return fake

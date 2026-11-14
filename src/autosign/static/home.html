@@ -11,7 +11,7 @@
 <header>
   <div class="bar">
     <a class="brand" href="/">AutoSign <small>client agreements, signed on every file</small></a>
-    <nav><a href="/verify">Check a signed copy</a><a href="/docs">API</a></nav>
+    <nav><a href="/dashboard">Dashboard</a><a href="/verify">Check a signed copy</a><a href="/docs">API</a></nav>
   </div>
 </header>
 
@@ -19,43 +19,53 @@
   <section class="card">
     <h1>Get your client agreement signed on every file</h1>
     <p class="muted">Upload the agreement (as a PDF) that every new client must sign. AutoSign finds where your company
-      signs and where the client signs, even in an agreement it has never seen, and signs it for your company.
-      Then, for each new client file, you copy a signing link and send it. The client signs in the browser,
-      and you get the signed PDF.</p>
+      signs and where the client signs, even in an agreement it has never seen. For each client, DocuSeal puts your
+      company's signature on, you check it, and DocuSeal emails the client to sign.</p>
     <ol class="steps">
-      <li><b>Upload</b> your agreement as a PDF, once.</li>
+      <li><b>Enter your details and upload</b> your agreement as a PDF, once. AutoSign writes your name in cursive: that is your company's signature.</li>
       <li><b>Check</b> the signature places AutoSign found. It asks you to confirm whenever it isn't sure.</li>
-      <li><b>AutoSign signs for your company</b>, once, on the copy every client will sign.</li>
-      <li><b>Open a client file</b> (one per client case) and copy its signing link to the client.</li>
-      <li><b>The client signs</b>; the signed PDF and the audit log are on your agreement page.</li>
+      <li><b>Add a client</b> (name and email). DocuSeal signs the client's copy for your company, with today's date, and you check it.</li>
+      <li><b>Send it.</b> DocuSeal emails the client, who signs on DocuSeal's page.</li>
+      <li><b>Get the signed PDF:</b> DocuSeal emails it to you and the client, and the dashboard shows where every client is.</li>
     </ol>
   </section>
 
   <section class="card">
-    <h2>1. Upload your client agreement</h2>
+    <h2>1. Your details and your client agreement</h2>
     <form id="upload" class="stack">
       <label class="field">Your company's name
         <input type="text" id="firm" name="firm_name" required minlength="2" maxlength="120" placeholder="e.g. Astra AI" autocomplete="organization">
         <span class="hint">As it is written in the agreement. It tells AutoSign which signature block is yours, not the client's.</span>
       </label>
-      <label class="field">Who signs for your company (optional)
-        <input type="text" id="signer" name="company_signer" maxlength="100" placeholder="e.g. Dana Reyes, Director" autocomplete="name">
-        <span class="hint">Shown on the signing certificate. AutoSign signs with your company's signature image set up on the server.</span>
+      <label class="field">Who signs for your company
+        <input type="text" id="signer" name="company_signer" required minlength="2" maxlength="100" placeholder="e.g. Dana Reyes" autocomplete="name">
+        <span class="hint">Their full name. AutoSign writes it in cursive as your company's signature, and prints it on the Name line of your block.</span>
+      </label>
+      <div class="sig-preview" id="signature-preview" aria-live="polite">
+        <span class="muted small">Your signature appears here as you type the name.</span>
+      </div>
+      <label class="field">Their job title (optional)
+        <input type="text" id="title" name="signer_title" maxlength="80" placeholder="e.g. Director" autocomplete="organization-title">
+        <span class="hint">Kept in DocuSeal's signing record and on your dashboard. It isn't written on the agreement.</span>
+      </label>
+      <label class="field">Your company's email
+        <input type="email" id="email" name="company_email" required maxlength="200" placeholder="e.g. contracts@astra.ai" autocomplete="email">
+        <span class="hint">DocuSeal sends you every signed copy here, and the client's replies come here too.</span>
       </label>
       <label class="field">The agreement (PDF)
         <input type="file" id="file" name="file" required accept=".pdf,application/pdf">
-        <span class="hint">PDF only, up to 25 MB and 100 pages. Word files: save as PDF first. Use test documents only.</span>
+        <span class="hint">PDF only, up to 25 MB and 50 pages, not yet signed by anyone. Word files: save as PDF first. Use test documents only.</span>
       </label>
       <div class="row">
         <button class="btn primary" type="submit" id="submit">Upload and find the signature places</button>
-        <span class="muted small" id="busy" hidden>Reading the agreement and finding where the client signs. This takes up to a minute.</span>
+        <span class="muted small" id="busy" hidden>Reading the agreement and finding where everyone signs. This takes up to a minute.</span>
       </div>
     </form>
   </section>
 
   <section class="card small muted">
-    There are no accounts. After uploading you get a private page for the agreement: <b>bookmark it</b>,
-    because it is the only way back to your agreement and its client files. Anyone you give a link to can open it.
+    There are no accounts. Every agreement is listed on the <a href="/dashboard">dashboard</a>, so share this site's
+    link only with the people who send your agreements.
   </section>
 </main>
 
@@ -66,6 +76,29 @@
 "use strict";
 
 const form = document.getElementById("upload");
+const signerInput = document.getElementById("signer");
+
+// A preview of the cursive signature, made by the server exactly as it will be used.
+let previewTimer = null;
+
+function showSignaturePreview() {
+  const box = document.getElementById("signature-preview");
+  const name = signerInput.value.trim();
+  if (name.length < 2) {
+    box.innerHTML = '<span class="muted small">Your signature appears here as you type the name.</span>';
+    return;
+  }
+  const image = document.createElement("img");
+  image.src = `/api/signature-preview.png?name=${encodeURIComponent(name)}`;
+  image.alt = `Signature preview: ${name}`;
+  box.replaceChildren(image);
+}
+
+signerInput.addEventListener("input", () => {
+  clearTimeout(previewTimer);
+  previewTimer = setTimeout(showSignaturePreview, 300);
+});
+showSignaturePreview();
 
 form.addEventListener("submit", (event) => {
   event.preventDefault();
@@ -73,8 +106,6 @@ form.addEventListener("submit", (event) => {
     const submit = document.getElementById("submit");
     const busy = document.getElementById("busy");
     const data = new FormData(form);
-    // The date written next to your company's signature is today's date where you are.
-    data.append("tz_offset_minutes", String(-new Date().getTimezoneOffset()));
     submit.disabled = true;
     busy.hidden = false;
     try {

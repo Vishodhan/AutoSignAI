@@ -5,16 +5,16 @@ These look at documents from the side of one party, "ours": Acme Analytics Inc. 
 """
 
 import io
-from pathlib import Path
+import time
 
 import pymupdf
 import pytest
 
 from autosign import ai, pipeline, storage, workflow
 from helpers import (ASPECT, DATA, SAMPLES, SETTINGS, box_doc, client_signed, client_signed_visibly, company_trap,
-                     encrypted_doc, filled_service_contract, multi_block_doc, ours, page_break_doc, paragraph,
-                     scanned_doc, side_by_side, sign_proposal, signature_field_doc, two_party_doc,
-                     two_usual_roles_doc, unnamed_party_doc, sample, witness_doc)
+                     date_field_on_line_doc, encrypted_doc, filled_service_contract, multi_block_doc, ours,
+                     page_break_doc, paragraph, scanned_doc, short_date_line_doc, side_by_side,
+                     signature_field_doc, two_party_doc, two_usual_roles_doc, unnamed_party_doc, sample, witness_doc)
 
 # =============================================================================
 # Detect: spots, blocks, owners and red flags
@@ -85,6 +85,38 @@ def test_side_by_side_blocks(tmp_path):
     client = next(s for s in analysis["spots"] if s["header"] == "CLIENT")
     assert client["owner"] == "theirs", (client["block_text"], client["owner_reason"], analysis["parties"]["roles"])
     assert analysis["red_flags"] == []
+    # Each column keeps its own date line: the client's date isn't put on the Service Provider's.
+    client_date = next(d for d in analysis["dates"] if d["id"] == client["date_id"])
+    assert client_date["kind"] == "line" and client_date["area"][2] < 300
+    assert client["date_id"] != pick[0]["date_id"]
+
+
+def test_each_block_s_name_line_is_found_in_its_own_column(tmp_path):
+    analysis = pipeline.analyze(side_by_side(tmp_path), SETTINGS, ASPECT)
+    for spot in analysis["spots"]:
+        name = next(n for n in analysis["names"] if n["id"] == spot["name_id"])
+        assert name["label"] == "Name:" and name["kind"] == "line"
+        assert name["area"][0] == spot["line"][0]                  # under its own signature, not the other column's
+        assert name["area"][1] > spot["line"][1]                   # below the signature line
+
+
+def test_print_name_form_fields_are_the_name_lines(tmp_path):
+    analysis = pipeline.analyze(filled_service_contract(tmp_path), SETTINGS, ASPECT)
+    names = sorted(name["field_name"] for name in analysis["names"])
+    assert names == ["Print Name", "Print Name_2"]
+
+
+def test_a_name_line_already_filled_in_is_left_alone(tmp_path):
+    from helpers import signature_rows
+    doc = pymupdf.open()
+    page = doc.new_page(width=612, height=792)
+    page.insert_text((72, 80), 'Agreement between Acme Analytics Inc. (the "Provider") and the Client.', fontsize=11)
+    signature_rows(page, 72, 300, "CLIENT")
+    page.insert_text((116, 356), "Jordan Lee", fontsize=11)        # already printed on the Name line
+    path = tmp_path / "name_filled.pdf"
+    doc.save(path)
+    analysis = pipeline.analyze(str(path), SETTINGS, ASPECT)
+    assert analysis["names"] == []
 
 
 def test_company_means_the_client(tmp_path):
@@ -248,65 +280,43 @@ def test_empty_blocks_count_only_when_they_match_the_signed_ones(tmp_path):
 
 
 # =============================================================================
-# Sign: unsigned PDFs, digitally signed PDFs, the signature image
+# Every block, dates, digital signatures, and the company's signature
 # =============================================================================
 
-def test_every_one_of_our_blocks_is_signed(tmp_path):
-    pdf = multi_block_doc(tmp_path)
-    analysis = pipeline.analyze(pdf, SETTINGS, ASPECT)
+def test_every_one_of_our_blocks_is_found(tmp_path):
+    analysis = pipeline.analyze(multi_block_doc(tmp_path), SETTINGS, ASPECT)
     pick = ours(analysis)
     assert [s["page"] for s in pick] == [2, 3] and all(s["header"] == "SERVICE PROVIDER" for s in pick)
-    result, _ = sign_proposal(pdf, analysis, tmp_path / "signed.pdf")
-    assert result["ok"], result["checks"]
-    doc = pymupdf.open(tmp_path / "signed.pdf")
-    assert [len(doc[n].get_image_info()) for n in range(3)] == [0, 1, 1]       # one stamp on each signature page
-    assert all("Nov 10, 2026" in doc[n].get_text() for n in (1, 2))
+    assert all(s["date_id"] for s in pick)
 
 
-def test_sign_unsigned_pdf(tmp_path):
-    pdf = filled_service_contract(tmp_path)
-    before = storage.fingerprint(Path(pdf).read_bytes())
-    analysis = pipeline.analyze(pdf, SETTINGS, ASPECT)
-    out = tmp_path / "signed.pdf"
-    result, placement = sign_proposal(pdf, analysis, out)
-    assert result["ok"], result["checks"]
-    assert storage.fingerprint(Path(pdf).read_bytes()) == before              # the original is untouched
-    doc = pymupdf.open(out)
-    page = doc[placement["page"] - 1]
-    boxes = [i["bbox"] for i in page.get_image_info()]
-    assert any(abs(b[0] - placement["signature"][0]) < 1.5 for b in boxes)
-    assert [w.field_value for w in page.widgets() if w.field_name == "Date_2"] == ["Nov 10, 2026"]
-    assert [w.field_value for w in page.widgets() if w.field_name == "Date"] == [""]   # the other party's date stays blank
-    doc.close()
-    assert not (tmp_path / "signed.work.pdf").exists()
-
-
-def test_sign_with_date_on_a_line(tmp_path):
-    pdf = side_by_side(tmp_path)
-    analysis = pipeline.analyze(pdf, SETTINGS, ASPECT)
-    out = tmp_path / "signed.pdf"
-    result, placement = sign_proposal(pdf, analysis, out)
-    assert result["ok"], result["checks"]
-    page = pymupdf.open(out)[1]
-    assert "Nov 10, 2026" in page.get_text()
+def test_the_date_on_a_line_is_in_its_own_column(tmp_path):
+    analysis = pipeline.analyze(side_by_side(tmp_path), SETTINGS, ASPECT)
+    placement = pipeline.placements_for_spots(analysis, [{"spot": s["id"], "date": s["date_id"]} for s in ours(analysis)],
+                                              side_by_side(tmp_path, name="again.pdf"), ASPECT, "Nov 10, 2026")[0]
     assert placement["date"]["point"][0] > 330                          # in the Service Provider column
 
 
-@pytest.mark.parametrize("level", ["approval", 3])
-def test_a_digitally_signed_pdf_keeps_its_signature_valid(tmp_path, level):
-    pdf = client_signed(tmp_path, level)
-    analysis = pipeline.analyze(pdf, SETTINGS, ASPECT)
-    assert analysis["mode"] == "annotation"
-    if level == "approval":
-        assert analysis["lock_level"] is None
-    else:
-        assert analysis["lock_level"] == 3
-    out = tmp_path / "countersigned.pdf"
-    result, _ = sign_proposal(pdf, analysis, out)
-    assert result["ok"], result["checks"]
-    assert any(c["title"] == "Digital signatures still valid" and c["passed"] for c in result["checks"])
-    assert out.read_bytes().startswith(Path(pdf).read_bytes())          # append-only: their bytes are untouched
-    assert all(r["intact"] and r["valid"] for r in pipeline.validate_signatures(str(out)))
+def test_a_tight_date_is_written_at_9_pt(tmp_path):
+    date_text = time.strftime(SETTINGS["date_format"])
+    at_10_pt = pymupdf.get_text_length(date_text, fontname="helv", fontsize=10)
+    at_9_pt = pymupdf.get_text_length(date_text, fontname="helv", fontsize=9)
+    length = round((at_10_pt + at_9_pt) / 2 + 1)             # too short for 10 pt, long enough for 9 pt
+    analysis = pipeline.analyze(short_date_line_doc(tmp_path, length), SETTINGS, ASPECT)
+    assert analysis["dates"][0]["placement"]["size"] == 9
+
+
+def test_a_date_line_too_short_even_at_9_pt_has_no_room(tmp_path):
+    analysis = pipeline.analyze(short_date_line_doc(tmp_path, 46), SETTINGS, ASPECT)   # any date is wider at 9 pt
+    assert analysis["dates"][0]["placement"]["fits"] is False
+
+
+def test_a_form_field_on_the_date_line_gets_the_date(tmp_path):
+    analysis = pipeline.analyze(date_field_on_line_doc(tmp_path), SETTINGS, ASPECT)
+    date = analysis["dates"][0]
+    assert date["kind"] == "field"
+    assert date["field_name"] == "ClientDate"
+    assert date["placement"]["fits"]
 
 
 @pytest.mark.parametrize("level", [1, 2])
@@ -326,25 +336,59 @@ def test_a_visible_digital_signature_is_not_a_label(tmp_path):
     assert len([s for s in analysis["spots"] if s["kind"] == "signature"]) == 2
 
 
-def test_an_uploaded_signature_gets_a_transparent_background():
-    from PIL import Image, ImageDraw
-    image = Image.new("RGB", (400, 120), "white")
-    ImageDraw.Draw(image).line([(20, 90), (120, 30), (200, 95), (380, 40)], fill=(10, 20, 90), width=6)
-    raw = io.BytesIO()
-    image.save(raw, "JPEG")
-    cleaned = Image.open(io.BytesIO(workflow.signature_png(raw.getvalue())))
-    assert cleaned.mode == "RGBA"
-    assert cleaned.getchannel("A").getextrema()[0] == 0                # the background is see-through
-    assert cleaned.width < 400                                          # cropped to the ink
-    assert abs(cleaned.width / cleaned.height - ASPECT) < 0.02          # padded to the stamp's shape
+def test_the_company_signature_is_a_cursive_name_shaped_like_a_place():
+    from PIL import Image
+    png = workflow.typed_signature_png("Dana Reyes", storage.SIGNATURE_FONT)
+    image = Image.open(io.BytesIO(png))
+    assert image.mode == "RGBA"
+    assert image.getchannel("A").getextrema()[0] == 0                 # no background
+    assert abs(image.width / image.height - ASPECT) < 0.01            # the shape of a signature place
+    ink = image.getchannel("A").getbbox()
+    assert ink[0] > 0 and ink[1] > 0 and ink[2] < image.width and ink[3] < image.height     # inside, with a margin
 
 
-def test_your_signature_image_can_be_used():
-    """Your real data/signature.png (the image AutoSign signs with for your company) is usable."""
-    real = DATA / "signature.png"
-    if not real.exists():
-        pytest.skip("data/signature.png isn't there")
-    workflow.signature_png(real.read_bytes())
+def test_a_long_name_still_fits_its_signature_place():
+    from PIL import Image
+    png = workflow.typed_signature_png("Maximilian Alexander Featherstonehaugh-Worthington", storage.SIGNATURE_FONT)
+    image = Image.open(io.BytesIO(png))
+    ink = image.getchannel("A").getbbox()
+    assert ink[2] < image.width                                       # never cut off on the right
+
+
+def test_a_signature_needs_a_name():
+    with pytest.raises(ValueError, match="name"):
+        workflow.typed_signature_png("   ", storage.SIGNATURE_FONT)
+
+
+# =============================================================================
+# Places that would overlap, and a malformed AI answer
+# =============================================================================
+
+def test_two_places_sharing_one_date_line_are_reported():
+    analysis = {"spots": [{"id": 1, "name_id": None}, {"id": 2, "name_id": None}],
+                "dates": [{"id": 3, "area": [370, 263, 540, 277]}], "names": []}
+    date = {"rect": [373, 265, 432, 275]}
+    client = [{"page": 2, "spot_id": 1, "signature": [114, 160, 226, 192], "date_id": 3, "date": date}]
+    company = [{"page": 2, "spot_id": 2, "signature": [372, 160, 484, 192], "date_id": 3, "date": date}]
+    problems = workflow.overlap_problems(analysis, client, company)
+    assert problems == ["the client's spot 1 (date) and your company's spot 2 (date) would overlap on page 2"]
+
+
+def test_separate_places_are_not_reported(tmp_path):
+    found = workflow.detect(side_by_side(tmp_path), "Acme Analytics Inc.")
+    problems = workflow.overlap_problems(found["analysis"], found["client_placements"], found["company"]["placements"])
+    assert problems == []
+
+
+@pytest.mark.parametrize("answer", [["not", "an", "object"], {"picks": [7], "company_picks": []},
+                                    {"picks": [], "company_picks": ["spot 2"]}])
+def test_a_malformed_ai_answer_is_set_aside_not_a_crash(answer, monkeypatch, tmp_path):
+    pdf = side_by_side(tmp_path)
+    analysis = pipeline.analyze(pdf, SETTINGS, ASPECT)
+    monkeypatch.setattr(ai, "available", lambda: True)
+    monkeypatch.setattr(ai, "chat_json", lambda system, text, images, schema: (answer, "stand-in"))
+    opinion = ai.ask_ai(pdf, analysis, "Acme Analytics Inc.")
+    assert opinion["ok"] is False and opinion["error"]
 
 
 # =============================================================================

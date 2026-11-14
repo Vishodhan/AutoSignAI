@@ -2,6 +2,7 @@
 Test support: the test documents (each with a known right answer) and the helpers the tests share.
 """
 
+import base64
 import datetime
 import io
 from pathlib import Path
@@ -9,7 +10,7 @@ from pathlib import Path
 import pymupdf
 import pytest
 
-from autosign import pipeline, storage, workflow
+from autosign import docuseal, pipeline, storage, workflow
 from autosign.policy import SIGNATURE_ASPECT
 
 # =============================================================================
@@ -329,6 +330,47 @@ def client_signed_visibly(folder, blocks=2, signed=1):
     return str(path)
 
 
+def engagement_letter(doc):
+    """A new page with the opening of a client engagement letter (the firm doesn't sign it)."""
+    page = doc.new_page(width=612, height=792)
+    page.insert_text((72, 80), "CLIENT ENGAGEMENT AGREEMENT", fontsize=16, fontname="hebo")
+    paragraph(page, 100, 'This Agreement is made between Acme Analytics Inc. (the "Firm") and the client named '
+                         'below (the "Client"). The Firm will start work once the Client signs.')
+    return page
+
+
+def date_field_on_line_doc(folder):
+    """Labels printed under the lines, and an empty 'Date' form field drawn on the date line (like the
+    Georgia power of attorney): the date goes into that field."""
+    doc = pymupdf.open()
+    page = engagement_letter(doc)
+    page.insert_text((72, 370), "CLIENT", fontsize=11, fontname="hebo")
+    page.draw_line((72, 400), (300, 400), color=(0, 0, 0), width=0.8)
+    page.insert_text((72, 412), "Your signature", fontsize=11)
+    page.draw_line((360, 400), (468, 400), color=(0, 0, 0), width=0.8)
+    page.insert_text((360, 412), "Date", fontsize=11)
+    field = pymupdf.Widget()
+    field.field_type = pymupdf.PDF_WIDGET_TYPE_TEXT
+    field.field_name = "ClientDate"
+    field.rect = pymupdf.Rect(360, 387, 468, 399.8)
+    page.add_widget(field)
+    path = Path(folder) / "date_field_on_line.pdf"
+    doc.save(path)
+    return str(path)
+
+
+def short_date_line_doc(folder, date_line_length):
+    """A client block whose 'Date:' line is `date_line_length` points long."""
+    doc = pymupdf.open()
+    page = engagement_letter(doc)
+    signature_rows(page, 72, 400, "CLIENT", labels=("Signature:", "Name:"))
+    page.insert_text((72, 486), "Date:", fontsize=11, fontname="helv")
+    page.draw_line((112, 487), (112 + date_line_length, 487), color=(0, 0, 0), width=0.8)
+    path = Path(folder) / f"short_date_line_{date_line_length}.pdf"
+    doc.save(path)
+    return str(path)
+
+
 def two_party_doc(folder, name, preamble, left_header, right_header):
     """A one-page contract: a preamble, then two side-by-side signature blocks."""
     doc = pymupdf.open()
@@ -359,8 +401,8 @@ SETTINGS = {
     "date_format": "%b %d, %Y",
 }
 ASPECT = SIGNATURE_ASPECT     # the shape of every stamp, as in the app
-# The company's signature image the app uses (under the tests' own AUTOSIGN_HOME, see conftest.py).
-TEST_SIGNATURE = storage.COMPANY_SIGNATURE
+# A test signature image (under the tests' own AUTOSIGN_HOME, made by conftest.py): never a real one.
+TEST_SIGNATURE = storage.HOME / "test-signature.png"
 
 
 def ours(analysis):
@@ -376,15 +418,6 @@ SAMPLES = {
     "LLC-Operating-Agreement-Template-QuickSigner.pdf": (6, 2, "operating_agreement"),
 }
 
-
-def sign_proposal(pdf, analysis, out):
-    """Sign every block the rules say is ours. Returns (result, first placement)."""
-    date_text = "Nov 10, 2026"
-    png = workflow.signature_png(TEST_SIGNATURE.read_bytes())
-    choices = [{"spot": s["id"], "date": s["date_id"]} for s in ours(analysis)]
-    placements = pipeline.placements_for_spots(analysis, choices, pdf, ASPECT, date_text)
-    result = pipeline.sign_pdf(pdf, str(out), placements, png, date_text, analysis["mode"], "Test Signer")
-    return result, placements[0]
 
 
 def agreeing_ai(pdf_path, analysis, firm_name):
@@ -412,23 +445,12 @@ def agreeing_ai(pdf_path, analysis, firm_name):
 FIRM = "Acme Analytics Inc."
 
 
-def signature_data_url():
-    """A client's signature as the signing page sends it: a PNG data: URL."""
-    import base64
-    from PIL import Image, ImageDraw
-    image = Image.new("RGBA", (420, 120), (0, 0, 0, 0))
-    points = [(10, 90), (60, 20), (110, 100), (170, 30), (230, 95), (300, 35), (410, 80)]
-    ImageDraw.Draw(image).line(points, fill=(10, 10, 60, 255), width=7)
-    out = io.BytesIO()
-    image.save(out, "PNG")
-    return "data:image/png;base64," + base64.b64encode(out.getvalue()).decode("ascii")
-
-
-def upload_agreement(client, path, firm=FIRM, signer="Dana Reyes", expect=200):
+def upload_agreement(client, path, firm=FIRM, signer="Dana Reyes", title="Director", email="contracts@acme.test",
+                     expect=200):
     """Upload an agreement as the home page does. Returns the agreement as the agreement page sees it."""
     data = Path(path).read_bytes()
     files = [("file", (Path(path).name, data, "application/pdf"))]
-    form = {"firm_name": firm, "company_signer": signer, "tz_offset_minutes": "0"}
+    form = {"firm_name": firm, "company_signer": signer, "signer_title": title, "company_email": email}
     response = client.post("/api/agreements", files=files, data=form)
     assert response.status_code == expect, response.text
     if expect != 200:
@@ -437,10 +459,19 @@ def upload_agreement(client, path, firm=FIRM, signer="Dana Reyes", expect=200):
     return client.get(f"/api/agreements/{token}").json()
 
 
-def new_client_file(client, agreement, name="Foo Holdings LLC", reference="2026-014"):
-    response = client.post(f"/api/agreements/{agreement['token']}/files",
-                           json={"client_name": name, "reference": reference})
-    assert response.status_code == 200, response.text
+def new_client_file(client, agreement, name="Foo Holdings LLC", email="jordan@foo.test", reference="2026-014",
+                    expect=200):
+    """Prepare a client's copy in DocuSeal, as the agreement page does."""
+    body = {"client_name": name, "client_email": email, "reference": reference, "tz_offset_minutes": 0}
+    response = client.post(f"/api/agreements/{agreement['token']}/files", json=body)
+    assert response.status_code == expect, response.text
+    return response.json()
+
+
+def send_file(client, file, expect=200):
+    """The company checked the copy: DocuSeal emails the client."""
+    response = client.post(file["send_url"], json={})
+    assert response.status_code == expect, response.text
     return response.json()
 
 
@@ -454,7 +485,7 @@ def places_body(agreement, client_spots=None, company_spots=None, company_manual
         company_manual = agreement["company"]["manual"]
     client_places = {"choices": [{"spot": spot_id} for spot_id in client_spots], "manual": agreement["client"]["manual"]}
     company_places = {"choices": [{"spot": spot_id} for spot_id in company_spots], "manual": company_manual}
-    return {"client": client_places, "company": company_places, "tz_offset_minutes": 0}
+    return {"client": client_places, "company": company_places}
 
 
 def confirm_places(client, agreement, body, expect=200):
@@ -463,10 +494,138 @@ def confirm_places(client, agreement, body, expect=200):
     return response.json()
 
 
-def sign_as_client(client, file, name="Jordan Lee", expect=200):
-    token = file["sign_url"].rsplit("/", 1)[1]
-    assert client.get(f"/api/sign/{token}").status_code == 200        # the client opens the link first
-    body = {"signer_name": name, "signature": signature_data_url(), "consent": True, "tz_offset_minutes": 0}
-    response = client.post(f"/api/sign/{token}", json=body)
-    assert response.status_code == expect, response.text
-    return response.json()
+# =============================================================================
+# A stand-in for DocuSeal's API (the tests never reach the real one; see conftest.py)
+# =============================================================================
+
+FAKE_SENT_AT = "2026-11-14T15:00:00.000Z"
+FAKE_OPENED_AT = "2026-11-14T15:05:00.000Z"
+FAKE_SIGNED_AT = "2026-11-14T15:10:00.000Z"
+
+
+def area_rect(page, area):
+    """A DocuSeal area (fractions of the page) back in PDF points."""
+    width = page.rect.width
+    height = page.rect.height
+    return pymupdf.Rect(area["x"] * width, area["y"] * height, (area["x"] + area["w"]) * width,
+                        (area["y"] + area["h"]) * height)
+
+
+def fill_fields(pdf, fields, values):
+    """Write values into fields the way DocuSeal does: an image for a signature, text for the rest."""
+    doc = pymupdf.open(stream=pdf, filetype="pdf")
+    for field in fields:
+        value = values.get(field["name"])
+        if value is None:
+            continue
+        for area in field["areas"]:
+            page = doc[area["page"] - 1]
+            rect = area_rect(page, area)
+            if field["type"] == "signature":
+                page.insert_image(rect, stream=base64.b64decode(value), keep_proportion=True)
+            else:
+                page.insert_text((rect.x0, rect.y1 - 2), str(value), fontsize=9)
+    return doc.tobytes()
+
+
+class FakeDocuSeal:
+    """Keeps submissions in memory and answers like DocuSeal's API (the parts AutoSign uses)."""
+
+    def __init__(self):
+        self.submissions = {}
+        self.requests = []
+        self.emails = []
+        self.next_id = 100
+        self.extra_field = None         # a field name DocuSeal would add on its own (it must be caught)
+
+    def call(self, method, path, body=None):
+        self.requests.append((method, path, body))
+        parts = path.strip("/").split("/")
+        if len(parts) > 1 and parts[0] == "submissions" and parts[1] != "pdf" and int(parts[1]) not in self.submissions:
+            raise docuseal.DocuSealError("DocuSeal refused the request (HTTP 404: Not found)")
+        if method == "POST" and path == "/submissions/pdf":
+            return self.create(body)
+        if method == "GET" and parts[0] == "submissions" and len(parts) == 3:
+            return {"documents": [{"name": "agreement", "url": f"https://docuseal.test/{parts[1]}.pdf"}]}
+        if method == "GET" and parts[0] == "submissions":
+            return self.state(int(parts[1]))
+        if method == "PUT" and parts[0] == "submitters":
+            return self.update_submitter(int(parts[1]), body)
+        if method == "DELETE" and parts[0] == "submissions":
+            self.submissions[int(parts[1])]["archived"] = True
+            return {"id": int(parts[1])}
+        raise AssertionError(f"The stand-in DocuSeal got a call it doesn't know: {method} {path}")
+
+    def download(self, url):
+        submission_id = int(url.rsplit("/", 1)[1].removesuffix(".pdf"))
+        return self.submissions[submission_id]["pdf"]
+
+    def create(self, body):
+        submission_id = self.next_id
+        self.next_id += 10
+        document = body["documents"][0]
+        submitters = []
+        values = {}
+        for index, given in enumerate(body["submitters"]):
+            submitter = dict(given, id=submission_id + index + 1, status="awaiting", sent_at=None, opened_at=None,
+                             completed_at=None, declined_at=None)
+            if given.get("completed"):
+                submitter["status"] = "completed"
+                submitter["completed_at"] = FAKE_SENT_AT
+                values.update(given.get("values") or {})
+            submitters.append(submitter)
+        pdf = fill_fields(base64.b64decode(document["file"]), document["fields"], values)
+        self.submissions[submission_id] = {"body": body, "submitters": submitters, "pdf": pdf, "completed": False,
+                                           "archived": False}
+        fields = [{"name": field["name"], "type": field["type"]} for field in document["fields"]]
+        if self.extra_field:
+            fields.append({"name": self.extra_field, "type": "text"})
+        return {"id": submission_id, "status": "pending", "fields": fields, "submitters": submitters}
+
+    def state(self, submission_id):
+        submission = self.submissions[submission_id]
+        status = "pending"
+        if submission["completed"]:
+            status = "completed"
+        return {"id": submission_id, "status": status, "submitters": submission["submitters"]}
+
+    def update_submitter(self, submitter_id, body):
+        for submission in self.submissions.values():
+            for submitter in submission["submitters"]:
+                if submitter["id"] == submitter_id:
+                    if body.get("send_email"):
+                        submitter["sent_at"] = FAKE_SENT_AT
+                        self.emails.append(submitter["email"])
+                    return submitter
+        raise AssertionError(f"no submitter {submitter_id}")
+
+    def client(self, submission_id):
+        for submitter in self.submissions[submission_id]["submitters"]:
+            if submitter["role"] == "Client":
+                return submitter
+        raise AssertionError("no client")
+
+    def client_opens(self, submission_id):
+        self.client(submission_id)["opened_at"] = FAKE_OPENED_AT
+
+    def client_signs(self, submission_id, signature_png, date_text="Nov 14, 2026"):
+        """The client signs on DocuSeal's page: their signature and date go into their fields."""
+        submission = self.submissions[submission_id]
+        fields = submission["body"]["documents"][0]["fields"]
+        prefilled = self.client(submission_id).get("values") or {}
+        values = {}
+        for field in fields:
+            if field["role"] != "Client":
+                continue
+            if field["type"] == "signature":
+                values[field["name"]] = base64.b64encode(signature_png).decode("ascii")
+            elif field["type"] == "date":
+                values[field["name"]] = date_text
+            else:
+                values[field["name"]] = prefilled.get(field["name"], "The Client")
+        submission["pdf"] = fill_fields(submission["pdf"], fields, values)
+        submission["completed"] = True
+        client = self.client(submission_id)
+        client["status"] = "completed"
+        client["opened_at"] = client["opened_at"] or FAKE_OPENED_AT
+        client["completed_at"] = FAKE_SIGNED_AT

@@ -7,6 +7,7 @@ requires-python = ">=3.12"
 dependencies = [
     "fastapi>=0.162.4",
     "google-genai>=1.0.0",
+    "httpx>=0.28.1",
     "pillow>=13.0.0",
     "pyhanko>=0.38.1",
     "pymupdf>=2.1",
@@ -20,6 +21,7 @@ autosign = "autosign.app:main"
 [dependency-groups]
 dev = [
     "httpx>=0.28.1",
+    "openpyxl>=3.1.5",
     "pytest>=9.2.0",
 ]
 
@@ -32,5 +34,5 @@ module-name = "autosign"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-markers = ["live: calls Google Gemini (needs GEMINI_API_KEY; run: uv run pytest -m live -s)"]
+markers = ["live: calls Google Gemini or the DocuSeal Sandbox (needs their keys in .env; run: uv run pytest -m live -s)"]
 addopts = "-m 'not live'"

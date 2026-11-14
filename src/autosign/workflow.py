@@ -1,11 +1,11 @@
 """
 The AutoSign workflow, on top of the pipeline:
 
-    detect()           find where the client signs and where the company signs (rules + AI)
-    check_places()     check the places after the company changed them on the agreement page
-    presign()          stamp the company's signature once; every client signs that pre-signed copy
-    sign()             stamp the client's signature on the pre-signed copy
-    add_certificate()  append the page that records how the agreement was signed
+    detect()                find where the client signs and where the company signs (rules + AI)
+    check_places()          check the places after the company changed them on the agreement page
+    typed_signature_png()   the company's signature: the signer's name in cursive
+
+DocuSeal then puts the company's signature on, and collects the client's (see docuseal.py).
 
 The pipeline judges every block from the side of one party, "ours". Here that party is the
 client, so the pipeline's "ours" means "the client's", and the company sending the agreement is
@@ -14,26 +14,24 @@ passed in as the other party.
 Who signs where is kept as places: {"choices": [{"spot": id, "date": id or None}, ...],
 "manual": [{"page": n, "x": x, "y": y, "date": [x, y] or None}, ...]}. The choices are spots
 AutoSign found; the manual places were clicked by hand on a page. Placements are the exact
-positions of the stamps and dates for some places.
+positions of the signatures and dates for some places: DocuSeal's fields go there.
 """
 
 import io
-import os
 import time
-from pathlib import Path
 
 import pymupdf
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 
-from autosign import ai, pipeline
-from autosign.policy import CLIENT_ROLES, DATE_FORMAT, KNOWN_ROLES, SIGNATURE_ASPECT
+from autosign import ai, docuseal, pipeline
+from autosign.policy import (CLIENT_ROLES, DATE_FORMAT, KNOWN_ROLES, SIGNATURE_ASPECT, SIGNATURE_HEIGHTS, SIGNATURE_INK,
+                             SIGNATURE_PIXELS_PER_POINT)
 
 ONLY_THE_CLIENT_SIGNS = ("No place is set for your company's signature, so only the client will sign. "
                          "To sign for your company too, choose its place below.")
-
-
-class SigningError(Exception):
-    """Signing failed in a way the person signing should be told about."""
+ALREADY_SIGNED = ("This PDF already carries a digital signature. DocuSeal removes a PDF's own signature fields "
+                  "when it signs, so that signature would no longer be verifiable. Upload the agreement before "
+                  "anyone has signed it.")
 
 
 def client_settings(firm_name):
@@ -116,6 +114,24 @@ def summarize(analysis, client, company):
     return summary
 
 
+def date_notes(client_placements, company_placements):
+    """A note for each place that is signed without its date, because the date doesn't fit there."""
+    notes = []
+    for placement in client_placements:
+        if placement.get("date_left_off"):
+            notes.append(date_note(placement, "the client's place"))
+    for placement in company_placements:
+        if placement.get("date_left_off"):
+            notes.append(date_note(placement, "your company's place"))
+    return notes
+
+
+def date_note(placement, whose):
+    return (f"Spot {placement['spot_id']} on page {placement['page']} ({whose}) is signed without a date, because "
+            f"{placement['date_left_off']}. To include a date, choose 'Left empty' for this spot and add the "
+            f"place by hand.")
+
+
 def check_overlaps(placements):
     """Raises ValueError when two stamps would cover each other."""
     for index, first in enumerate(placements):
@@ -124,6 +140,42 @@ def check_overlaps(placements):
                 continue
             if pipeline.intersects(first["signature"], second["signature"], pad=0):
                 raise ValueError(f"two signatures would overlap on page {first['page']}")
+
+
+def place_label(placement, whose):
+    """A place as the company reads it: "the client's spot 3", or "your company's place added by hand on page 2"."""
+    if placement.get("spot_id"):
+        return f"{whose} spot {placement['spot_id']}"
+    return f"{whose} place added by hand on page {placement['page']}"
+
+
+def filled_boxes(analysis, placements, whose):
+    """(what, page, rect) for everything DocuSeal will fill at these places: each signature, date and name."""
+    boxes = []
+    for placement in placements:
+        label = place_label(placement, whose)
+        page = placement["page"]
+        boxes.append((f"{label} (signature)", page, placement["signature"]))
+        date = docuseal.date_rect(analysis, placement)
+        if date is not None:
+            boxes.append((f"{label} (date)", page, date))
+        name = docuseal.name_rect(analysis, placement)
+        if name is not None:
+            boxes.append((f"{label} (name)", page, name))
+    return boxes
+
+
+def overlap_problems(analysis, client_placements, company_placements):
+    """Every two things DocuSeal would fill on top of each other: two signatures, or two places that
+    share one date line or one name line. Returns one sentence per overlap."""
+    boxes = filled_boxes(analysis, client_placements, "the client's")
+    boxes += filled_boxes(analysis, company_placements, "your company's")
+    problems = []
+    for index, first in enumerate(boxes):
+        for second in boxes[index + 1:]:
+            if first[1] == second[1] and pipeline.intersects(first[2], second[2], pad=0):
+                problems.append(f"{first[0]} and {second[0]} would overlap on page {first[1]}")
+    return problems
 
 
 def placements_for(analysis, places, pdf_path, date_text=None):
@@ -265,6 +317,8 @@ def detect(pdf_path, firm_name):
     in the document needs a person's eye. Raises ValueError when the file can't be used at all.
     """
     analysis = pipeline.analyze(pdf_path, client_settings(firm_name), SIGNATURE_ASPECT)
+    if analysis["signatures"]:
+        raise ValueError(ALREADY_SIGNED)
     opinion = ai.ask_ai(pdf_path, analysis, firm_name)
     spots = spots_by_id(analysis)
 
@@ -302,6 +356,9 @@ def detect(pdf_path, firm_name):
         reasons.append(f"Your company's signature doesn't fit at its place ({error}). Choose another place below.")
         company = no_places()
         company_placements = []
+
+    for problem in overlap_problems(analysis, client_placements, company_placements):
+        reasons.append(f"Two places would overlap: {problem}. Choose the places below.")
 
     company["placements"] = company_placements
     company["note"] = None
@@ -373,175 +430,54 @@ def check_places(analysis, edited, pdf_path):
     client_placements = placements_for(analysis, client, pdf_path)
     company_placements = placements_for(analysis, company, pdf_path)
     check_overlaps(client_placements + company_placements)
+    problems = overlap_problems(analysis, client_placements, company_placements)
+    if problems:
+        raise ValueError(f"{problems[0]}. Leave one of them empty, or add its place by hand")
     return client, client_placements, company, company_placements
 
 
 # =============================================================================
-# Signing: the company once, then each client
+# The company's signature: the signer's name in cursive
 # =============================================================================
 
-def opacity_for(gray):
-    """How opaque a pixel of this grey level (0 black, 255 white) becomes: near-white is see-through."""
-    if gray > 225:
-        return 0
-    return min(255, (225 - gray) * 3)
+def fitted_font(name, font_path, max_width, max_height):
+    """The cursive font at the largest size whose writing of `name` fits in the box."""
+    size = int(max_height)
+    while size > 8:
+        font = ImageFont.truetype(str(font_path), size)
+        left, top, right, bottom = font.getbbox(name)
+        if right - left <= max_width and bottom - top <= max_height:
+            return font
+        size -= 2
+    return ImageFont.truetype(str(font_path), 8)
 
 
-def clear_background(image):
-    """An image with no transparency gets it, so the stamp never hides the line it sits on."""
-    if image.getchannel("A").getextrema()[0] < 255:
-        return image
-    image.putalpha(image.convert("L").point(opacity_for))
-    return image
+def typed_signature_png(name, font_path):
+    """The signer's name in cursive, in dark blue ink on a transparent PNG.
 
-
-def pad_to_aspect(image):
-    """The image on a transparent canvas shaped SIGNATURE_ASPECT: a wide signature gets space above and
-    below, any other gets space on the right (it stays left-aligned)."""
-    width, height = image.size
-    if width / height > SIGNATURE_ASPECT:
-        canvas_size = (width, round(width / SIGNATURE_ASPECT))
-        position = (0, (canvas_size[1] - height) // 2)
-    else:
-        canvas_size = (round(height * SIGNATURE_ASPECT), height)
-        position = (0, 0)
-    canvas = Image.new("RGBA", canvas_size, (0, 0, 0, 0))
-    canvas.paste(image, position, image)
-    return canvas
-
-
-def signature_png(data):
-    """A signature image ready to stamp, as PNG bytes: background cleared, cropped to the ink, padded.
-
-    Every stamp place was sized for SIGNATURE_ASPECT, so a padded signature always fits its place
-    exactly: it is never stretched, and never too wide for its line. The image file itself is
-    never changed.
+    The image has the shape of a signature place (SIGNATURE_ASPECT) and is drawn at
+    SIGNATURE_PIXELS_PER_POINT pixels per point of the largest place (112 x 32 pt, so 448 x 128 px):
+    it prints sharply, and DocuSeal fits it exactly into each place without stretching it.
+    Raises ValueError when there is no name or the font is missing.
     """
-    try:
-        image = Image.open(io.BytesIO(data)).convert("RGBA")
-    except Exception as error:
-        raise SigningError(f"The signature image can't be read ({error})")
-    image = clear_background(image)
-    ink = image.getchannel("A").getbbox()
-    if ink is None:
-        raise SigningError("The signature image is empty once its white background is removed")
-    image = image.crop(ink)
-    if image.width > 1200:
-        image = image.resize((1200, max(1, round(image.height * 1200 / image.width))))
-    if image.width < 40 or image.height < 8:
-        raise SigningError("The signature is too small. Add your full signature.")
+    name = " ".join(str(name or "").split())
+    if not name:
+        raise ValueError("enter the name of the person who signs for your company")
+    if not font_path.exists():
+        raise ValueError(f"the cursive font isn't installed on this server ({font_path.name})")
+    height = SIGNATURE_HEIGHTS[0] * SIGNATURE_PIXELS_PER_POINT
+    width = round(height * SIGNATURE_ASPECT)
+    margin = round(height * 0.06)
+    font = fitted_font(name, font_path, width - 2 * margin, height - 2 * margin)
+    image = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(image)
+    left, top, right, bottom = draw.textbbox((0, 0), name, font=font)
+    x = margin - left
+    y = (height - (bottom - top)) / 2 - top
+    draw.text((x, y), name, font=font, fill=SIGNATURE_INK + (255,))
     out = io.BytesIO()
-    pad_to_aspect(image).save(out, "PNG")
+    image.save(out, "PNG")
     return out.getvalue()
-
-
-def failed_checks(result):
-    titles = []
-    for check in result["checks"]:
-        if not check["passed"]:
-            titles.append(check["title"])
-    return ", ".join(titles)
-
-
-def presign(original, analysis, company, client_placements, signature_image, signer_name, date_text, out_path):
-    """Stamp the company's signature (and the date) at its places, on the copy every client will sign.
-
-    Returns the placements. Raises SigningError when the company's signature can't go on; the
-    original agreement is never changed either way.
-    """
-    try:
-        png = signature_png(signature_image)
-    except SigningError as error:
-        raise SigningError(f"Your company's signature image can't be used: {error}")
-    try:
-        placements = placements_for(analysis, company, str(original), date_text)
-        check_overlaps(placements + client_placements)
-    except ValueError as error:
-        raise SigningError(f"Your company's signature doesn't fit at its place ({error})")
-    result = pipeline.sign_pdf(str(original), str(out_path), placements, png, date_text, analysis["mode"],
-                               signer_name)
-    if not result["ok"]:
-        raise SigningError(f"The copy with your company's signature failed its checks ({failed_checks(result)})")
-    return placements
-
-
-def sign(pdf_path, analysis, places, image, signer_name, date_text, out_path):
-    """Stamp the client's signature (and the date) at every place. Returns (placements, the stamped PNG)."""
-    png = signature_png(image)
-    try:
-        placements = placements_for(analysis, places, pdf_path, date_text)
-    except ValueError as error:
-        raise SigningError(f"The signature places no longer fit this document ({error})")
-    result = pipeline.sign_pdf(pdf_path, out_path, placements, png, date_text, analysis["mode"], signer_name)
-    if not result["ok"]:
-        raise SigningError(f"The signed copy failed its checks ({failed_checks(result)}). Nothing was signed.")
-    return placements, png
-
-
-# =============================================================================
-# The signing certificate: a last page that records how the agreement was signed
-# =============================================================================
-
-CONSENT_TEXT = ("I agree to sign this agreement electronically, and that my electronic signature has the same "
-                "effect as my handwritten signature.")
-CERTIFICATE_GREY = (0.35, 0.38, 0.45)
-CERTIFICATE_INK = (0.08, 0.1, 0.15)
-
-
-def write_certificate_row(page, left, right, y, label, value, monospace):
-    """One label and its value. Returns the height where the next row starts."""
-    page.insert_text((left, y + 8), label, fontsize=8.5, fontname="helv", color=CERTIFICATE_GREY)
-    if monospace:
-        font = "cour"
-        size = 8
-    else:
-        font = "helv"
-        size = 10
-    box = pymupdf.Rect(left + 150, y, right, y + 60)
-    page.insert_textbox(box, value, fontsize=size, fontname=font, color=CERTIFICATE_INK)
-    width = pymupdf.get_text_length(value, fontname=font, fontsize=size)
-    lines = int(width // box.width) + 1
-    return y + max(18, lines * (size + 3) + 6)
-
-
-def write_certificate(page, rows, signatures):
-    left = 54
-    right = page.rect.width - 54
-    y = 64
-    page.insert_text((left, y), "Signing certificate", fontsize=18, fontname="hebo", color=(0.1, 0.15, 0.3))
-    y += 18
-    intro = "Added by AutoSign when this agreement was signed. It records who signed, when, and how."
-    page.insert_textbox(pymupdf.Rect(left, y, right, y + 30), intro, fontsize=9, fontname="helv",
-                        color=CERTIFICATE_GREY)
-    y += 34
-    for label, value, monospace in rows:
-        y = write_certificate_row(page, left, right, y, label, str(value), monospace)
-    for label, png in signatures:
-        y += 6
-        page.insert_text((left, y + 8), label, fontsize=8.5, fontname="helv", color=CERTIFICATE_GREY)
-        box = pymupdf.Rect(left + 150, y - 4, left + 150 + 44 * SIGNATURE_ASPECT, y + 40)
-        page.insert_image(box, stream=png, keep_proportion=True)
-        y += 50
-
-
-def add_certificate(signed_path, rows, signatures, mode):
-    """Append the certificate page to the signed PDF. Returns False when the PDF must keep its bytes.
-
-    `rows` are (label, value, monospace) lines; `signatures` are (label, PNG) pairs shown below them.
-    A PDF that already carries digital signatures is only ever changed append-only, so no page is
-    added there; the same details are in the audit log either way.
-    """
-    if mode != "content":
-        return False
-    signed_path = Path(signed_path)
-    work = signed_path.with_name(signed_path.stem + ".work.certificate.pdf")
-    with pymupdf.open(signed_path) as doc:
-        size = doc[0].rect
-        page = doc.new_page(width=size.width, height=size.height)
-        write_certificate(page, rows, signatures)
-        doc.save(work, garbage=3, deflate=True)
-    os.replace(work, signed_path)
-    return True
 
 
 # =============================================================================
@@ -552,7 +488,6 @@ PICTURE_DPI = 110
 CLIENT_GREEN = (0, 0.55, 0.2)
 COMPANY_BLUE = (0.1, 0.35, 0.85)
 OTHER_GREY = (0.45, 0.45, 0.45)
-SIGN_HERE_ORANGE = (0.85, 0.5, 0)
 
 
 def page_of(doc, page_number):
@@ -587,8 +522,7 @@ def spot_color(spot_id, client_ids, company_ids):
 
 def render_for_company(pdf_path, page_number, analysis, client, client_placements, company):
     """A page as the company checks it. Every signature spot is outlined and numbered (green: the
-    client's, blue: the company's, grey: left empty), and each place is drawn in. The company's
-    places are drawn until its signature is on the page."""
+    client's, blue: the company's, grey: left empty), and each place is drawn in."""
     client_ids = chosen_spot_ids(client)
     company_ids = chosen_spot_ids(company)
     with pymupdf.open(pdf_path) as doc:
@@ -599,20 +533,9 @@ def render_for_company(pdf_path, page_number, analysis, client, client_placement
         for placement in client_placements:
             if placement["page"] == page_number:
                 draw_place(page, placement, CLIENT_GREEN, "the client")
-        if not company.get("signed_at"):
-            for placement in company.get("placements") or []:
-                if placement["page"] == page_number:
-                    draw_place(page, placement, COMPANY_BLUE, "your company")
-        return page.get_pixmap(dpi=PICTURE_DPI).tobytes("png")
-
-
-def render_for_signer(pdf_path, page_number, placements):
-    """A page as the client reads it, with each place to sign highlighted."""
-    with pymupdf.open(pdf_path) as doc:
-        page = page_of(doc, page_number)
-        for placement in placements:
+        for placement in company.get("placements") or []:
             if placement["page"] == page_number:
-                draw_place(page, placement, SIGN_HERE_ORANGE, "Sign here")
+                draw_place(page, placement, COMPANY_BLUE, "your company")
         return page.get_pixmap(dpi=PICTURE_DPI).tobytes("png")
 
 
