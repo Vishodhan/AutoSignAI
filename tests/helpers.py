@@ -141,6 +141,43 @@ def signature_field_doc(folder):
     return str(out)
 
 
+def form_cells_doc(folder, filled_name=None):
+    """A government-style form (like SF-30's boxes 15 and 16): ruled cells with their labels printed at
+    the top. The Name cells (15A, 16A) are above the signature cells (15B, 16B, empty signature fields),
+    the Date cells (15C, 16C) beside them. filled_name is already typed in cell 15A."""
+    from pyhanko.pdf_utils.incremental_writer import IncrementalPdfFileWriter
+    from pyhanko.sign import fields
+    doc = pymupdf.open()
+    page = doc.new_page(width=612, height=792)
+    page.insert_text((72, 80), "AMENDMENT OF SOLICITATION / MODIFICATION OF CONTRACT", fontsize=12, fontname="hebo")
+    for y in (639, 676, 731):
+        page.draw_line((20, y), (589, y))
+    for x in (20, 300, 589):
+        page.draw_line((x, 639), (x, 731))
+    for x in (228, 516):
+        page.draw_line((x, 676), (x, 731))
+    labels = [((21, 648), "15A. NAME AND TITLE OF SIGNER (Type or print)"),
+              ((302, 648), "16A. NAME AND TITLE OF CONTRACTING OFFICER (Type or print)"),
+              ((21, 685), "15B. CONTRACTOR/OFFEROR"), ((230, 685), "15C. DATE SIGNED"),
+              ((302, 685), "16B. UNITED STATES OF AMERICA"), ((518, 685), "16C. DATE SIGNED"),
+              ((62, 727), "(Signature of person authorized to sign)"), ((330, 727), "(Signature of Contracting Officer)")]
+    for point, text in labels:
+        page.insert_text(point, text, fontsize=7)
+    if filled_name:
+        page.insert_text((30, 668), filled_name, fontsize=10)
+    base = Path(folder) / "form_cells_base.pdf"
+    doc.save(base)
+    out = Path(folder) / "form_cells.pdf"
+    with open(base, "rb") as inf:
+        writer = IncrementalPdfFileWriter(inf)
+        # pyHanko boxes use PDF coordinates (origin bottom-left): y 792-713=79 to 792-691=101.
+        fields.append_signature_field(writer, fields.SigFieldSpec("ContractorSignature", box=(26, 79, 223, 101), on_page=0))
+        fields.append_signature_field(writer, fields.SigFieldSpec("OfficerSignature", box=(306, 79, 511, 101), on_page=0))
+        with open(out, "wb") as outf:
+            writer.write(outf)
+    return str(out)
+
+
 def box_doc(folder):
     """A signature box: an outlined rectangle with 'Signature' printed inside."""
     doc = pymupdf.open()

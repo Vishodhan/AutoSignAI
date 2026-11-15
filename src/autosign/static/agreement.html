@@ -87,7 +87,7 @@
     <div class="grid-2">
       <div>
         <p class="muted small">Choose who signs at each place AutoSign found. If it missed one, add it by hand and
-          click the page where it goes.</p>
+          click where its box should start (the top-left corner).</p>
         <div class="spot-list" id="spots"></div>
         <div class="spot-list spaced" id="manual"></div>
         <div class="row spaced" id="add-buttons">
@@ -497,11 +497,14 @@ function firstSigningPage() {
 }
 
 // ---------------------------------------------------------------------------
-// Adding a place by hand: click the signature's centre, then (optionally) the date's start
+// Adding a place by hand: each box starts where the company clicks (its top-left corner).
+// First the signature, then (optionally) the date.
 // ---------------------------------------------------------------------------
 
-const SIGNATURE_HEIGHT = 32;      // pt, as the server stamps a place added by hand
+const SIGNATURE_HEIGHT = 32;      // pt, the same sizes the server uses for a place added by hand
 const SIGNATURE_ASPECT = 3.5;
+const DATE_WIDTH = 130;
+const DATE_HEIGHT = 14;
 
 function updatePlacing() {
   const active = placing !== null;
@@ -516,16 +519,21 @@ function updatePlacing() {
   }
   const whose = placing.side === "client" ? "the client's" : "your company's";
   if (!placing.sig) {
-    help.textContent = `Click the page where ${whose} signature should go (its centre).`;
+    help.textContent = `Click where ${whose} signature should start: the box's top-left corner goes where you click.`;
   } else {
-    help.textContent = "Now click where the date should start, or press 'No date for this place'.";
+    help.textContent = "Now click where the date should start (its top-left corner), or press 'No date for this place'.";
   }
 }
 
-function pointFromClick(event) {
+// Page points per screen pixel of the page picture as it is shown now.
+function pictureScale() {
   const image = document.getElementById("page-image");
-  const box = image.getBoundingClientRect();
-  const scale = image.clientWidth / pageSize(currentPage).width;
+  return image.getBoundingClientRect().width / pageSize(currentPage).width;
+}
+
+function pointFromClick(event) {
+  const box = document.getElementById("page-image").getBoundingClientRect();
+  const scale = pictureScale();
   return {
     x: Math.round(((event.clientX - box.left) / scale) * 10) / 10,
     y: Math.round(((event.clientY - box.top) / scale) * 10) / 10,
@@ -590,30 +598,52 @@ function finishPendingPlace() {
   updatePlacing();
 }
 
-// Boxes over the picture for the places added by hand (saved ones are drawn into the picture too).
+// Where a box starts so that it stays 2 pt inside the page, as the server places it.
+function insidePage(start, size, pageLength) {
+  const latestStart = pageLength - size - 2;
+  if (start > latestStart) {
+    return latestStart;
+  }
+  if (start < 2) {
+    return 2;
+  }
+  return start;
+}
+
+// One box over the page picture, its top-left corner at (x, y) in page points.
+function addMark(side, x, y, width, height, scale) {
+  const size = pageSize(currentPage);
+  const left = insidePage(x, width, size.width);
+  const top = insidePage(y, height, size.height);
+  const mark = document.createElement("div");
+  mark.className = `mark ${side}`;
+  mark.style.left = `${left * scale}px`;
+  mark.style.top = `${top * scale}px`;
+  mark.style.width = `${width * scale}px`;
+  mark.style.height = `${height * scale}px`;
+  document.getElementById("page-box").appendChild(mark);
+}
+
+// Boxes over the picture for the places added by hand, signature and date
+// (saved ones are drawn into the picture too).
 function drawMarks() {
   const box = document.getElementById("page-box");
   box.querySelectorAll(".mark").forEach((mark) => mark.remove());
   const image = document.getElementById("page-image");
-  const size = pageSize(currentPage);
-  if (!size || !image.clientWidth) {
+  if (!pageSize(currentPage) || !image.clientWidth) {
     return;
   }
   const marks = manualPlaces.filter((place) => place.page === currentPage);
   if (placing && placing.sig) {
-    marks.push({ side: placing.side, x: placing.sig.x, y: placing.sig.y });
+    marks.push({ side: placing.side, x: placing.sig.x, y: placing.sig.y, date: null });
   }
-  const scale = image.clientWidth / size.width;
-  const height = SIGNATURE_HEIGHT * scale;
-  const width = SIGNATURE_HEIGHT * SIGNATURE_ASPECT * scale;
+  const scale = pictureScale();
+  const signatureWidth = SIGNATURE_HEIGHT * SIGNATURE_ASPECT;
   for (const place of marks) {
-    const mark = document.createElement("div");
-    mark.className = `mark ${place.side}`;
-    mark.style.left = `${place.x * scale - width / 2}px`;
-    mark.style.top = `${place.y * scale - height / 2}px`;
-    mark.style.width = `${width}px`;
-    mark.style.height = `${height}px`;
-    box.appendChild(mark);
+    addMark(place.side, place.x, place.y, signatureWidth, SIGNATURE_HEIGHT, scale);
+    if (place.date) {
+      addMark(place.side, place.date[0], place.date[1], DATE_WIDTH, DATE_HEIGHT, scale);
+    }
   }
 }
 

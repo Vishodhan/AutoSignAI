@@ -14,7 +14,7 @@ import pymupdf
 import pytest
 from PIL import Image
 
-from autosign import ai, app, docuseal, storage, workflow
+from autosign import ai, app, docuseal, pipeline, storage, workflow
 from autosign.policy import MAX_PAGES
 from helpers import (FIRM, TEST_SIGNATURE, agreeing_ai, area_rect, client_signed, confirm_places,
                      date_field_on_line_doc, multi_block_doc, new_client_file, paragraph, places_body, send_file,
@@ -242,7 +242,7 @@ def test_the_company_can_add_its_place_by_hand(client, fake_ai, fake_docuseal, t
     assert agreement["company"]["spots"] == []
     assert agreement["company"]["note"] == workflow.ONLY_THE_CLIENT_SIGNS
 
-    by_hand = [{"page": 1, "x": 420, "y": 600, "date": None}]
+    by_hand = [{"page": 1, "x": 380, "y": 600, "date": [380, 650]}]
     confirmed = confirm_places(client, agreement, places_body(agreement, company_manual=by_hand))
     assert confirmed["company"]["manual"][0]["page"] == 1
     assert "Your company signs on page 1 (placed by hand)" in confirmed["summary"]
@@ -250,8 +250,20 @@ def test_the_company_can_add_its_place_by_hand(client, fake_ai, fake_docuseal, t
     new_client_file(client, confirmed)
     fields = fields_of(latest_body(fake_docuseal))
     page = pymupdf.open(storage.agreement_pdf(stored(agreement)))[0]
-    rect = area_rect(page, fields["Company signature 1"]["areas"][0])
-    assert abs((rect.x0 + rect.x1) / 2 - 420) < 0.5 and abs((rect.y0 + rect.y1) / 2 - 600) < 0.5
+    signature = area_rect(page, fields["Company signature 1"]["areas"][0])
+    date = area_rect(page, fields["Company date 1"]["areas"][0])
+    # Each box starts exactly where the company clicked: its top-left corner.
+    assert abs(signature.x0 - 380) < 0.5 and abs(signature.y0 - 600) < 0.5
+    assert abs(date.x0 - 380) < 0.5 and abs(date.y0 - 650) < 0.5
+
+
+def test_a_place_added_by_hand_near_the_edge_stays_on_the_page(tmp_path):
+    pdf_path = client_only_doc(tmp_path)
+    page_width = pymupdf.open(pdf_path)[0].rect.width
+    placement = pipeline.manual_placement(pdf_path, 1, page_width - 10, 1, None, workflow.SIGNATURE_ASPECT)
+    x0, y0, x1, y1 = placement["signature"]
+    assert x1 <= page_width - 2 + 0.1
+    assert y0 >= 2
 
 
 def test_every_block_is_signed_in_a_two_part_agreement(client, fake_ai, fake_docuseal, tmp_path):

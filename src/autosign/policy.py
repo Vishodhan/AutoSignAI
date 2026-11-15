@@ -20,11 +20,18 @@ SIGNATURE_HEIGHTS = [32, 29, 26, 23, 20, 18]
 DROP_RATIOS = [0.15, 0.08, 0.0]    # Share of the stamp height that may sit below the line.
 # Date text sizes to try, largest first, when the date is tight. Never smaller than 9 pt, so it stays readable.
 DATE_FONT_SIZES = [10, 9]
+# A date box added by hand, in points. Its top-left corner is where the company clicked.
+MANUAL_DATE_WIDTH = 130
+MANUAL_DATE_HEIGHT = 14
 ROW_TOLERANCE = 3.5          # Words whose bottoms are this close share a row.
 SEGMENT_GAP = 12             # A wider gap splits a row into separate labels.
 HEADER_REACH = 70            # How far above a spot to look for its header ("PARTY A").
 BLOCK_REACH = 100            # How far below a spot to look for its Name, Title and Date rows.
 MAX_LABEL_WORDS = 6          # A signature label is short: "Service Provider's Signature".
+# Form cells: a label printed at the top of a ruled box, the writing space under it (government forms).
+CELL_DEPTH = 50              # How far below its label a cell's bottom rule may be.
+CELL_ABOVE_REACH = 60        # How far above a signature a 'Name' cell's label may be.
+CELL_BESIDE_REACH = 40       # How far right of a signature a 'Date' cell's label may start.
 
 
 # =============================================================================
@@ -38,9 +45,13 @@ NEVER_WORDS = {"witness", "witnessed", "notary", "notarial", "guarantor", "suret
                "attest", "attested", "attestation"}
 # Words that show a "signature" label is not a place to sign.
 # The words of a label for the signer's printed name: "Name:", "Print Name", "Printed name", "Name of
-# signatory". A label with any other word ("Company Name", "Client Name") asks for something else.
+# signatory", "Your name printed", "Name and Title of Signer (Type or print)", "Name of Contracting Officer".
+# A label with any other word ("Company Name", "Client Name") asks for something else. A form's box
+# number ("15A.") isn't counted.
 NAME_LABEL_WORDS = {"name", "print", "printed", "full", "type", "typed", "signatory", "signer", "authorized",
-                    "authorised", "of", "or", "please", "legal"}
+                    "authorised", "of", "or", "please", "legal", "and", "title", "your", "person", "signing",
+                    "principal", "officer", "contracting", "representative"}
+MAX_NAME_LABEL_WORDS = 9     # "Name and Title of Contracting Officer (Type or print)"
 NOT_A_SPOT_WORDS = {"page", "pages", "follows", "follow", "initial", "initials", "initialed",
                     "electronic", "electronically", "esign", "counterpart", "counterparts",
                     "whereof", "block", "blocks"}

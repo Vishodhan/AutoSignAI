@@ -106,6 +106,45 @@ def test_print_name_form_fields_are_the_name_lines(tmp_path):
     assert names == ["Print Name", "Print Name_2"]
 
 
+@pytest.mark.parametrize("label, expected", [
+    ("Name:", True),
+    ("Print Name", True),
+    ("Your name printed", True),
+    ("15A. NAME AND TITLE OF SIGNER (Type or print)", True),
+    ("16A. NAME AND TITLE OF CONTRACTING OFFICER (Type or print)", True),
+    ("Company Name", False),
+    ("Name of Contractor", False),
+    ("printing the name of the principal and signing your own name", False),
+])
+def test_name_labels(label, expected):
+    assert pipeline.is_name_label(label) == expected
+
+
+def test_a_form_s_name_and_date_cells_are_found(tmp_path):
+    """On a government form the Name cell is above the signature's cell and the Date cell beside it."""
+    from helpers import form_cells_doc
+    analysis = pipeline.analyze(form_cells_doc(tmp_path), SETTINGS, ASPECT)
+    spots = sorted(analysis["spots"], key=lambda spot: spot["area"][0])
+    assert len(spots) == 2
+    names = {name["id"]: name for name in analysis["names"]}
+    dates = {date["id"]: date for date in analysis["dates"]}
+    for spot, box in zip(spots, ("15", "16")):
+        name = names[spot["name_id"]]
+        assert name["kind"] == "cell" and name["label"].startswith(f"{box}A.")
+        assert name["area"][3] <= spot["area"][1]                       # above the signature
+        date = dates[spot["date_id"]]
+        assert date["kind"] == "cell" and date["label"] == f"{box}C. DATE SIGNED"
+        assert date["area"][0] >= spot["area"][2]                       # beside the signature
+        assert date["placement"]["fits"]
+
+
+def test_a_form_s_name_cell_already_filled_in_is_left_alone(tmp_path):
+    from helpers import form_cells_doc
+    analysis = pipeline.analyze(form_cells_doc(tmp_path, filled_name="Jordan Lee, President"), SETTINGS, ASPECT)
+    labels = [name["label"] for name in analysis["names"]]
+    assert labels == ["16A. NAME AND TITLE OF CONTRACTING OFFICER (Type or print)"]
+
+
 def test_a_name_line_already_filled_in_is_left_alone(tmp_path):
     from helpers import signature_rows
     doc = pymupdf.open()

@@ -24,8 +24,10 @@ import pymupdf
 from pyhanko.pdf_utils.reader import PdfFileReader
 
 from autosign.policy import (
-    BLOCK_REACH, DATE_FONT_SIZES, DOC_TYPE_PATTERNS, DROP_RATIOS, ENTITY_WORDS, EXECUTION_PATTERNS, FIELD_WORDS,
-    HEADER_REACH, INSTRUCTION_PATTERNS, KNOWN_ROLES, LEGAL_SUFFIXES, MAX_LABEL_WORDS, MIN_LINE_WIDTH,
+    BLOCK_REACH, CELL_ABOVE_REACH, CELL_BESIDE_REACH, CELL_DEPTH, DATE_FONT_SIZES, DOC_TYPE_PATTERNS, DROP_RATIOS,
+    ENTITY_WORDS, EXECUTION_PATTERNS, FIELD_WORDS,
+    HEADER_REACH, INSTRUCTION_PATTERNS, KNOWN_ROLES, LEGAL_SUFFIXES, MANUAL_DATE_HEIGHT, MANUAL_DATE_WIDTH,
+    MAX_LABEL_WORDS, MAX_NAME_LABEL_WORDS, MIN_LINE_WIDTH,
     NAME_LABEL_WORDS, NEVER_WORDS, NOT_A_SPOT_WORDS, NOT_SIGNING_DATE_WORDS, ROW_TOLERANCE, RULES_VERSION,
     SEGMENT_GAP, SIGN_WORDS, SIGNATURE_HEIGHTS,
 )
@@ -476,6 +478,7 @@ def read_page(doc, index):
     return {
         "number": index + 1, "width": width, "height": height, "rotation": page.rotation,
         "words": words, "blanks": blanks, "lines": lines, "fields": fields, "boxes": drawings["boxes"],
+        "rules": drawings["lines"], "verticals": drawings["verticals"],      # every drawn rule, table borders too
         "images": images, "annots": annots, "curves": drawings["curves"],
         "hidden": hidden_text(page, drawings["dark_fills"]),
         "scanned": looks_scanned(words, images, width, height),
@@ -919,7 +922,11 @@ def find_spots(page, rows):
     spots += box_spots(page, segments, used)
     spots += lone_label_spots(page, segments, rows, used)
     date_segments = [seg for seg in segments if seg["kind"] == "date"]
-    name_segments = [seg for seg in segments if seg["kind"] == "text" and is_name_label(seg["text"])]
+    name_segments = []
+    for seg in segments:
+        is_spot_label = id(seg) in used
+        if seg["kind"] == "text" and not is_spot_label and is_name_label(seg["text"]):
+            name_segments.append(seg)
     return drop_duplicate_spots(spots), date_segments, name_segments
 
 
@@ -1175,8 +1182,9 @@ def nearest(candidates):
     return min(candidates, key=lambda candidate: candidate[0])[1]
 
 
-def find_date_for(spot, page, date_segments):
-    """The date that belongs to a signature spot: on its row to the right, or in its block below."""
+def find_date_for(spot, page, date_segments, cell_dates):
+    """The date that belongs to a signature spot: on its row to the right, or in its block below,
+    or else in the form cell beside the signature's cell (cell_dates: the labels of form cells)."""
     candidates = labels_near(spot, date_segments)
     if spot["line"]:
         row_y, left_edge, right_edge = signature_row(spot)
@@ -1187,14 +1195,177 @@ def find_date_for(spot, page, date_segments):
             if abs(line["y"] - row_y) <= 4 and right_edge - 5 <= line["x0"] <= right_edge + 250:
                 candidates.append((abs(line["x0"] - left_edge) * 0.2, line["below"]))
     if not candidates:
-        return None
+        return date_cell_beside(spot, page, cell_dates)
     return located(nearest(candidates), page)
 
 
+# =============================================================================
+# Detect: form cells. On government forms each box is a ruled cell with its label printed at the
+# top ('15A. NAME AND TITLE OF SIGNER (Type or print)', '15C. DATE SIGNED'); what is written goes
+# in the empty space under the label. The Name cell is above the signature's cell, the Date cell beside it.
+# =============================================================================
+
+def border_between(left_word, right_word, verticals):
+    """A vertical rule (a table border) runs between two words of a row."""
+    for vertical in verticals:
+        x = (vertical[0] + vertical[2]) / 2
+        between = left_word["x1"] - 1 <= x <= right_word["x0"] + 1
+        crosses_row = vertical[1] <= right_word["y1"] and vertical[3] >= right_word["y0"]
+        if between and crosses_row:
+            return True
+    return False
+
+
+def split_at_borders(words, verticals):
+    """A label's words, split again wherever a table border runs between two of them."""
+    parts = [[words[0]]]
+    for previous, word in zip(words, words[1:]):
+        if border_between(previous, word, verticals):
+            parts.append([word])
+        else:
+            parts[-1].append(word)
+    return parts
+
+
+def cell_labels(page, rows):
+    """The 'Date' and 'Name' labels of a page's form cells. Labels of neighbouring cells can be close
+    enough to read as one ('15C. DATE SIGNED 16B. UNITED STATES OF AMERICA'), so each label is split
+    again at the table borders. Returns (date labels, name labels)."""
+    dates = []
+    names = []
+    for row in rows:
+        for group in split_row(row["words"]):
+            for part in split_at_borders(group, page["verticals"]):
+                text = join_text(part)
+                seg = {**bounds(part), "text": text, "kind": classify(text)}
+                if seg["kind"] == "date":
+                    dates.append(seg)
+                elif seg["kind"] == "text" and is_name_label(text):
+                    names.append(seg)
+    return dates, names
+
+
+def rule_just_above(seg, page):
+    """A drawn rule right above the label: the label is printed at the top of a cell."""
+    for rule in page["rules"]:
+        close_above = seg["y0"] - 6 <= rule["y"] <= seg["y0"] + 1
+        spans_label = rule["x0"] - 2 <= seg["x0"] <= rule["x1"]
+        if close_above and spans_label:
+            return True
+    return False
+
+
+def cell_bottom(seg, page):
+    """The first drawn rule under the label that spans its left edge (the cell's bottom), or None."""
+    bottom = None
+    for rule in page["rules"]:
+        below = seg["y1"] + 8 <= rule["y"] <= seg["y1"] + CELL_DEPTH
+        spans_label = rule["x0"] - 2 <= seg["x0"] + 2 <= rule["x1"]
+        if below and spans_label:
+            if bottom is None or rule["y"] < bottom:
+                bottom = rule["y"]
+    return bottom
+
+
+def cell_right(seg, page, top, bottom):
+    """The cell's right side: the first vertical rule right of the label crossing the cell, or the label's end."""
+    right = None
+    for vertical in page["verticals"]:
+        crosses_cell = vertical[1] <= bottom - 2 and vertical[3] >= top + 2
+        if crosses_cell and vertical[0] > seg["x0"] + 20:
+            if right is None or vertical[0] < right:
+                right = vertical[0]
+    if right is None:
+        return seg["x1"]
+    return right
+
+
+def field_in_cell(area, page):
+    """A text form field whose centre is in the cell's writing space (a fillable form), or None."""
+    x0, y0, x1, y1 = area
+    for field in page["fields"]:
+        if field["kind"] != "text":
+            continue
+        fx0, fy0, fx1, fy1 = field["rect"]
+        centre_x = (fx0 + fx1) / 2
+        centre_y = (fy0 + fy1) / 2
+        if x0 <= centre_x <= x1 and y0 <= centre_y <= y1:
+            return field
+    return None
+
+
+def cell_under_label(seg, page):
+    """What to fill in the cell whose label this is: its form field, or else its empty writing space.
+    None when the label isn't at the top of a cell, or the cell is already filled."""
+    if not rule_just_above(seg, page):
+        return None
+    bottom = cell_bottom(seg, page)
+    if bottom is None:
+        return None
+    top = seg["y1"] + 1
+    right = cell_right(seg, page, top, bottom)
+    area = [seg["x0"], top, right - 2, bottom - 1]
+    field = field_in_cell(area, page)
+    if field is not None:
+        target = field_target(field)
+    else:
+        target = {"kind": "cell", "area": rounded(area)}
+    if not nothing_written(target, page):
+        return None
+    target.update(page=page["number"], label=seg["text"], label_rect=rounded(rect_of(seg)))
+    return target
+
+
+def name_cell_above(spot, page, name_segments):
+    """A 'Name' cell right above the signature's cell, in the same column (SF-30: 15A above 15B), or None."""
+    row_y, left_edge, right_edge = signature_row(spot)
+    best = None
+    best_gap = None
+    for seg in name_segments:
+        aligned = abs(seg["x0"] - left_edge) <= 12
+        gap = spot["top"] - seg["y1"]
+        if not aligned or gap < 0 or gap > CELL_ABOVE_REACH:
+            continue
+        target = cell_under_label(seg, page)
+        if target is None or target["area"][3] > spot["top"] + 2:
+            continue
+        if best is None or gap < best_gap:
+            best = target
+            best_gap = gap
+    return best
+
+
+def date_cell_beside(spot, page, date_segments):
+    """A 'Date' cell right of the signature's cell, on the same row of cells (SF-30: 15C beside 15B), or None."""
+    row_y, left_edge, right_edge = signature_row(spot)
+    best = None
+    best_dx = None
+    for seg in date_segments:
+        dx = seg["x0"] - right_edge
+        if dx < -5 or dx > CELL_BESIDE_REACH:
+            continue
+        if seg["y0"] < spot["top"] - 20 or seg["y1"] > row_y:
+            continue
+        target = cell_under_label(seg, page)
+        if target is None:
+            continue
+        if best is None or dx < best_dx:
+            best = target
+            best_dx = dx
+    return best
+
+
+FORM_BOX_NUMBER = re.compile(r"^\d+[a-z]?$")       # '15a', '30b': a box number on a form
+
+
 def is_name_label(text):
-    """'Name:', 'Print Name', 'Printed name', 'Name of signatory': where the signer's printed name goes."""
-    toks = tokens(text)
-    if "name" not in toks or len(toks) > 4:
+    """'Name:', 'Print Name', 'Printed name', 'Name of signatory', '15A. NAME AND TITLE OF SIGNER (Type or
+    print)': where the signer's printed name goes."""
+    toks = []
+    for tok in tokens(text):
+        if not FORM_BOX_NUMBER.match(tok):
+            toks.append(tok)
+    if "name" not in toks or len(toks) > MAX_NAME_LABEL_WORDS:
         return False
     for tok in toks:
         if tok not in NAME_LABEL_WORDS:
@@ -1214,12 +1385,13 @@ def nothing_written(target, page):
     return True
 
 
-def find_name_for(spot, page, name_segments):
+def find_name_for(spot, page, name_segments, cell_names):
     """Where the signer's printed name goes in a spot's block ('Name: ____', or 'Print Name' under a
-    line), or None. A name line that already has something on it is left alone."""
+    line), or in the 'Name' cell above the signature on a form (cell_names: the labels of form cells);
+    or None. A name line that already has something on it is left alone."""
     candidates = labels_near(spot, name_segments)
     if not candidates:
-        return None
+        return name_cell_above(spot, page, cell_names)
     target = located(nearest(candidates), page)
     if not nothing_written(target, page):
         return None
@@ -1728,6 +1900,12 @@ def place_date(page, date, date_text):
         baseline = y - 2
         limit = x1 + 2              # the date stays on its line
         obstacles = obstacles_for(page, skip_line=date["line"])
+    elif date["kind"] == "cell":    # the empty space of a form cell, under its label
+        x0, y0, x1, y1 = date["area"]
+        x = x0 + 3
+        baseline = (y0 + y1) / 2 + 4
+        limit = x1
+        obstacles = obstacles_for(page)
     else:  # blank space after the label
         label = date["label_rect"]
         x = label[2] + 6
@@ -1853,13 +2031,14 @@ def detect_spots(pages, all_rows, date_text):
         if index > 0:
             previous_rows = all_rows[index - 1]
         page_spots, date_segments, name_segments = find_spots(page, rows)
+        cell_dates, cell_names = cell_labels(page, rows)
         build_blocks(page, rows, page_spots, previous_rows)
         for spot in page_spots:
             date = None
             name = None
             if spot["kind"] == "signature":
-                date = find_date_for(spot, page, date_segments)
-                name = find_name_for(spot, page, name_segments)
+                date = find_date_for(spot, page, date_segments, cell_dates)
+                name = find_name_for(spot, page, name_segments, cell_names)
             del spot["_block_rows"]
             spots.append(spot)
             spot_dates.append(date)
@@ -2035,8 +2214,22 @@ def placements_for_spots(analysis, choices, pdf_path, aspect, date_text):
     return placements
 
 
+def inside_page(start, size, page_size):
+    """Where a box of this size starts so that it stays 2 pt inside the page."""
+    latest_start = page_size - size - 2
+    if start > latest_start:
+        return latest_start
+    if start < 2:
+        return 2
+    return start
+
+
 def manual_placement(pdf_path, page_number, x, y, date_point, aspect):
-    """A place clicked by hand: the stamp centred where the person clicked, the date where they clicked next."""
+    """A place clicked by hand: each box starts where the person clicked (its top-left corner).
+
+    The first click is the signature's corner, the second (optional) one the date's. A box that would
+    run off the page is moved just enough to stay on it.
+    """
     with pymupdf.open(pdf_path) as doc:
         if not 1 <= page_number <= doc.page_count:
             raise ValueError(f"Page {page_number} doesn't exist")
@@ -2047,13 +2240,15 @@ def manual_placement(pdf_path, page_number, x, y, date_point, aspect):
         page_height = page.rect.height
     height = SIGNATURE_HEIGHTS[0]
     width = height * aspect
-    x0 = min(max(x - width / 2, 2), page_width - width - 2)          # kept 2 pt inside the page
-    y0 = min(max(y - height / 2, 2), page_height - height - 2)
+    x0 = inside_page(x, width, page_width)
+    y0 = inside_page(y, height, page_height)
     placement = {"page": page_number, "signature": rounded([x0, y0, x0 + width, y0 + height]), "spot_id": None,
                  "date": None, "date_left_off": None, "manual": True}
     if date_point:
-        date_x, date_y = date_point
-        placement["date"] = {"fits": True, "kind": "text", "point": [round(date_x, 1), round(date_y, 1)],
-                             "rect": rounded([date_x, date_y - 8, date_x + 130, date_y + 2]),
-                             "size": DATE_FONT_SIZES[0]}
+        date_x = inside_page(date_point[0], MANUAL_DATE_WIDTH, page_width)
+        date_y = inside_page(date_point[1], MANUAL_DATE_HEIGHT, page_height)
+        date_rect = [date_x, date_y, date_x + MANUAL_DATE_WIDTH, date_y + MANUAL_DATE_HEIGHT]
+        baseline = date_y + MANUAL_DATE_HEIGHT - 3
+        placement["date"] = {"fits": True, "kind": "text", "point": [round(date_x, 1), round(baseline, 1)],
+                             "rect": rounded(date_rect), "size": DATE_FONT_SIZES[0]}
     return placement

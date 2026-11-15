@@ -68,7 +68,10 @@ uv run pytest -m live -s         # live Gemini and DocuSeal Sandbox tests (keys 
 - Only the signature, the date and the Name line are filled, for each side. The company's Name line gets the
   signer's name; the client's is pre-filled with the client's name and the client can correct it. Title lines
   are never filled. Each date gets its whole date line as its DocuSeal box (DocuSeal pads text boxes and wraps
-  text that doesn't fit, so a box as narrow as the date wrapped it onto two lines).
+  text that doesn't fit, so a box as narrow as the date wrapped it onto two lines). A combined "Name and
+  Title" box gets the name only. On government forms (SF-30) the Name box above the signature box and the
+  Date box beside it are used (labels split at table borders). Places added by hand: each box's top-left
+  corner is where the company clicked.
 - The rules (PyMuPDF) find each block; Gemini checks and numbers them; DocuSeal fields go on those exact
   rectangles. Existing blocks are reused (printed lines, empty form fields), never duplicated; already signed
   places are left alone. PDFs that already carry a digital signature are refused at upload (DocuSeal removes

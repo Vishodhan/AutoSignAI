@@ -13,7 +13,7 @@ It must work on an agreement it has never seen before.
 | Part | What it does |
 |---|---|
 | **Web app** (Python 3.13, FastAPI) | The pages and the REST API. Plain HTML, CSS and JavaScript, no front-end framework. |
-| **PDF reading** (PyMuPDF, pyHanko) | Finds every signature place, its date line and its Name line, from the exact positions of the words, lines, boxes and form fields. Reads digital signatures already in the PDF. |
+| **PDF reading** (PyMuPDF, pyHanko) | Finds every signature place, its date line and its Name line (on government forms, the Name and Date boxes next to the signature box), from the exact positions of the words, lines, boxes and form fields. Reads digital signatures already in the PDF. |
 | **AI check** (Google Gemini 3.1 Flash-Lite) | A second opinion on which numbered places are the client's and which are the company's. It never gives positions. |
 | **Company signature** (Pillow) | Writes the signer's name in cursive (Great Vibes font, SIL Open Font License) as a transparent PNG. |
 | **Signing and email** (DocuSeal REST API) | Puts the company's signature on each client's copy, emails the client, hosts the client's signing page, seals the finished PDF, and emails the signed copy to both sides. |

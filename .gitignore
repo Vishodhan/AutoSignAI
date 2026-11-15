@@ -12,6 +12,9 @@ __pycache__/
 # Created by the app: agreements, signed copies, the audit log
 storage/
 
+# CSV files (audit logs downloaded from the app, test results)
+*.csv
+
 # Left over from the first version (a local tool)
 output/
 inbox/
